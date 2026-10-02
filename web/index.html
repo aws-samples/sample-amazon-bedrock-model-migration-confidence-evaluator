@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ModelShift — Migration Evaluation</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+<div class="app">
+  <aside class="rail">
+    <div class="brand">
+      <div class="logo">M</div>
+      <div><h1>ModelShift</h1><small>Migration Evaluation</small></div>
+    </div>
+    <nav class="nav" id="nav">
+      <a data-view="runs" class="active">Runs</a>
+      <a data-view="new">New Run</a>
+      <a data-view="settings">Settings</a>
+      <a data-view="guide">Guide</a>
+    </nav>
+    <div style="margin-top:auto" class="muted mono" id="apiStatus">connecting…</div>
+  </aside>
+  <main class="main" id="main"></main>
+</div>
+<script src="/app.js"></script>
+<script src="/guide.js"></script>
+</body>
+</html>

@@ -1,0 +1,4 @@
+{"data": [
+  {"id": "arr-1", "call_type": "acompletion", "model": "azure/gpt-4o", "messages": [{"role": "user", "content": "ping"}], "response": {"object": "chat.completion", "choices": [{"message": {"role": "assistant", "content": "pong"}, "finish_reason": "stop"}]}},
+  {"id": "arr-2", "call_type": "responses", "model": "azure/gpt-4o", "messages": "hello", "response": {"object": "response", "output_text": "hi", "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "hi"}]}]}}
+]}
