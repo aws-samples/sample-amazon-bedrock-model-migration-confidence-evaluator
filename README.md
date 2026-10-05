@@ -1,10 +1,8 @@
-# ModelShift
+# amazon-bedrock-model-migration-confidence-evaluator
 
-**LiteLLM → Bedrock GPT migration evaluation tool.**
+**Bedrock GPT migration evaluation tool.**
 
-ModelShift takes a customer's existing **LiteLLM logs** (legacy GPT models on Azure), **replays each captured request** against newer candidate GPT models on **Amazon Bedrock** using the **Responses API**, and **scores how compatible** the new responses are with the legacy "golden" responses — giving an evidence-backed *migration confidence* verdict, plus prompt / reasoning-effort / settings remediation suggestions.
-
-Built from the spec set in [`../gpt-migration-eval-spec/`](../gpt-migration-eval-spec/).
+ModelShift takes a customer's existing **LiteLLM logs**, **replays each captured request** against newer candidate GPT models on **Amazon Bedrock** using the **Responses API**, and **scores how compatible** the new responses are with the legacy "golden" responses — giving an evidence-backed *migration confidence* verdict, plus prompt / reasoning-effort / settings remediation suggestions.
 
 ## Demo
 
@@ -34,6 +32,19 @@ A newer model that is *more accurate* but changes the output format, drops a fac
 4. **Choose call path** — **Bedrock (direct)** or **LiteLLM proxy**.
 5. **Replay & score** — six dimensions (semantic, format/schema, factual, verbosity, instruction-following, tool-call) → four labels → **Migration Confidence 0–100** and a verdict band.
 6. **Remediate** — cluster failures by reason, suggest changes, re-test a subset, see a before/after delta.
+
+## Tune the judge to your use case (Skills / steering docs)
+
+Compatibility isn't the same for every workload — a dosage number, an order ID, or a specific disclaimer may be make-or-break for your consumers, while a greeting style or extra pleasantry may not matter at all. On the **New Run → Configuration** step you can hand the LLM-as-judge your own **evaluation steering** — either typed inline or uploaded as a **`.md` / `.txt`** "Skill" / steering document — to encode those use-case-specific nuances.
+
+The steering text is injected into the judge's prompt as explicit guidance, so the judge applies *your* rules when it scores each candidate answer against the golden. For example:
+
+> *"Treat any change to a dosage number or a member ID as Incompatible. A shorter answer that keeps every fact is Compatible. Ignore differences in greeting style or sign-off."*
+
+Notes:
+- **Affects the LLM-judge dimensions only.** Deterministic **hard breaks** (broken JSON schema, a diverged fact like a phone/email, a mismatched tool call) still cap a result at *Incompatible* regardless of steering — steering can tighten or relax the judgment calls, not override a structural break.
+- **Re-judged on change.** The steering text is part of the judge cache key, so editing it re-scores affected evaluations rather than serving a stale verdict.
+- **Reusable.** Keep your steering docs in version control and upload the right one per workload (claims triage, pharmacy, member chat, …) so each run is judged by the standard that use case actually cares about.
 
 ## Architecture
 
@@ -98,30 +109,3 @@ python -m pytest tests/ -q      # 62 tests
 python -m flake8 modelshift tests
 ```
 
-## Key API endpoints (`/api/v1`)
-
-`POST /runs` · `POST /uploads` · `POST /runs/{id}/ingest` · `GET /runs/{id}/ingestion` · `POST /runs/{id}/plan` (dry-run cost preview) · `POST /runs/{id}/launch` · `GET /runs/{id}/stream` (SSE) · `GET /runs/{id}/results` · `GET /runs/{id}/samples` · `PATCH /runs/{id}/samples/{sid}` (human override) · `GET /runs/{id}/remediations` · `GET /models` · `GET /settings`
-
-## Verification status
-
-**Verified (offline, this build):**
-- ✅ 62/62 unit + API tests pass; flake8 clean.
-- ✅ Ingestion parses all four real LiteLLM fixture shapes; reconciliation identity holds (17 found = 12 evaluable + 5 dropped across the fixtures).
-- ✅ Deterministic scoring: exact-match → Compatible; phone/email divergence, broken JSON, and tool-call mismatch → hard-break Incompatible.
-- ✅ Judge never overrides a hard-break; aggregation produces Migration Confidence + verdict bands + side-by-side ranking.
-- ✅ **Both call paths** exercised end-to-end: Bedrock adapter uses the `us.openai.gpt-5.6-*` inference-profile id; LiteLLM adapter uses the model-group alias.
-- ✅ Full API flow: upload → ingest → dry-run plan (no spend) → launch → results with a scored verdict; SSE stream emits progress + end.
-- ✅ Remediation cluster → subset re-test → before/after confidence delta.
-- ✅ Dry-run makes **zero** candidate calls.
-
-**NOT verified (requires the user's environment):**
-- ⛔ **Live Bedrock / LiteLLM calls** — needs AWS credentials with `bedrock:InvokeModel` on the GPT-5.6/GPT-5.4 inference profiles (and, for the LiteLLM path, a reachable proxy). The exact Responses-API request/response envelope should be validated against the live service (per prior experience, some constraints only surface on the real call).
-- ⛔ **Browser screenshot of the SPA** — the build host has no headless browser and Browser Mode was off, so the UI was verified through its data endpoints (assets 200, every endpoint returns coherent data), not a pixel capture. Enable Browser Mode to capture screenshots.
-- ⛔ **Persistence** — v1 uses an in-process run store (spec-sanctioned). A SQLite/Postgres + S3 object-store layer is the documented next step.
-
-## Not-yet-built (documented in the spec, deferred for v1)
-
-- SQLite/Postgres persistence + object store; SQS worker fan-out for large corpora.
-- Export report (HTML/PDF).
-- Embedding-based D1 (currently token-overlap; the LLM judge augments semantic scoring).
-- Auth for a deployed instance.
