@@ -177,6 +177,41 @@ def test_api_models_endpoint():
     assert any(e["legacy_model"] == "gpt-4.1" for e in body["matrix"])
 
 
+def test_manual_prompts_ingest():
+    """Hand-entered prompt/golden pairs synthesize into the same NormalizedSamples
+    as a Chat Completions log and run through the unchanged ingest pipeline."""
+    c = _client()
+    run_id = c.post("/api/v1/runs", json={"name": "manual"}).json()["run_id"]
+    body = {"manual_prompts": [
+        {"prompt": "Capital of France?", "golden": "Paris."},
+        {"prompt": "Return JSON", "golden": '{"ok": true}', "instructions": "Be terse."},
+        {"prompt": "", "golden": "skipped — empty prompt"},
+    ]}
+    r = c.post(f"/api/v1/runs/{run_id}/ingest", json=body)
+    assert r.status_code == 202
+    ing = r.json()["ingestion"]
+    # the empty-prompt row is skipped before ingest, so found == 2 and both evaluable
+    assert ing["found"] == 2
+    assert ing["evaluable"] == 2
+    assert ing["dropped"] == {}
+
+
+def test_manual_prompts_all_empty_is_400():
+    c = _client()
+    run_id = c.post("/api/v1/runs", json={"name": "manual-empty"}).json()["run_id"]
+    r = c.post(f"/api/v1/runs/{run_id}/ingest",
+               json={"manual_prompts": [{"prompt": "", "golden": ""}]})
+    assert r.status_code == 400
+
+
+def test_ingest_requires_a_source():
+    c = _client()
+    run_id = c.post("/api/v1/runs", json={"name": "no-source"}).json()["run_id"]
+    r = c.post(f"/api/v1/runs/{run_id}/ingest", json={})
+    assert r.status_code == 400
+    assert "manual_prompts" in r.json()["detail"]["error"]["message"]
+
+
 def test_api_end_to_end_upload_ingest_plan_launch():
     c = _client()
     # create

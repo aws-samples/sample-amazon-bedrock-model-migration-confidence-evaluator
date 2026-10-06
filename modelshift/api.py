@@ -101,9 +101,21 @@ class CreateRunBody(BaseModel):
     description: str = ""
 
 
+class ManualPrompt(BaseModel):
+    """A single hand-entered golden request: the prompt that was sent and the
+    response the current model gave. Optional system/developer instructions and a
+    legacy-model label. These are synthesized into Chat Completions-shaped rows and
+    run through the exact same ingest() pipeline as uploaded logs."""
+    prompt: str
+    golden: str
+    instructions: Optional[str] = None
+    model: Optional[str] = None
+
+
 class IngestBody(BaseModel):
     s3_uri: Optional[str] = None  # if omitted, use a prior /uploads upload_id
     upload_id: Optional[str] = None
+    manual_prompts: Optional[List[ManualPrompt]] = None  # UI-entered golden pairs
 
 
 class CandidateBody(BaseModel):
@@ -219,11 +231,48 @@ def get_run(run_id: str):
     }
 
 
+def _rows_from_manual_prompts(items: List["ManualPrompt"]) -> List[Dict[str, Any]]:
+    """Turn UI-entered prompt/golden pairs into Chat Completions-shaped rows.
+
+    Each row is the same shape a LiteLLM Chat Completions log line would have, so
+    the existing ingest() pipeline normalizes, evaluates, and scores them with no
+    special-casing downstream. Rows with an empty prompt or empty golden are
+    skipped here; ingest() would otherwise drop them as NO_PROMPT/EMPTY_RESPONSE.
+    """
+    rows: List[Dict[str, Any]] = []
+    for i, it in enumerate(items):
+        prompt = (it.prompt or "").strip()
+        golden = (it.golden or "").strip()
+        if not prompt or not golden:
+            continue
+        messages: List[Dict[str, Any]] = []
+        if it.instructions and it.instructions.strip():
+            messages.append({"role": "system", "content": it.instructions.strip()})
+        messages.append({"role": "user", "content": prompt})
+        rows.append({
+            "request_id": f"manual-{i}",
+            "model": it.model or "manual-input",
+            "messages": messages,
+            "response": {
+                "object": "chat.completion",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": golden}}],
+            },
+        })
+    return rows
+
+
 @app.post("/api/v1/runs/{run_id}/ingest", status_code=202)
 def ingest_run(run_id: str, body: IngestBody):
     r = _get_run(run_id)
     r.status = RunStatus.INGESTING
-    if body.upload_id:
+    if body.manual_prompts:
+        rows = _rows_from_manual_prompts(body.manual_prompts)
+        if not rows:
+            raise HTTPException(400, detail={"error": {"code": "conflict",
+                                "message": "provide at least one prompt with a golden response"}})
+        data = json.dumps(rows).encode("utf-8")
+        res = ingest([(data, "manual:ui")])
+    elif body.upload_id:
         data = _UPLOADS.get(body.upload_id)
         if data is None:
             raise HTTPException(400, detail={"error": {"code": "not_found", "message": "upload not found"}})
@@ -237,7 +286,7 @@ def ingest_run(run_id: str, body: IngestBody):
         res = ingest(objects, skipped_objects=skipped)
     else:
         raise HTTPException(400, detail={"error": {"code": "conflict",
-                                                   "message": "provide upload_id or s3_uri"}})
+                                                   "message": "provide manual_prompts, upload_id, or s3_uri"}})
     r.samples = res.samples
     r.ingestion = res.report
     r.status = RunStatus.INGESTED
