@@ -26,7 +26,7 @@ A newer model that is *more accurate* but changes the output format, drops a fac
 
 ## What it does
 
-1. **Load logs** — upload a LiteLLM log file or point at an `s3://bucket/prefix`.
+1. **Load logs — or enter prompts** — upload a LiteLLM log file, point at an `s3://bucket/prefix`, **or type one or more prompt / golden-response pairs directly in the UI** when you don't have a log export. Hand-entered pairs become the dataset and flow through the exact same pipeline as logged requests.
 2. **Auto-detect & normalize** — parses SpendLogs (`proxy_server_request`), wrapped-SDK, Chat Completions, and Responses shapes; converts legacy Chat Completions to the Responses API shape; drops non-evaluable rows with full accounting.
 3. **Pick candidates** — pre-filled from the migration matrix (GPT-4.1 → Luna/Terra/Sol, etc.), evaluated **side-by-side**, at **medium reasoning effort** by default.
 4. **Choose call path** — **Bedrock (direct)** or **LiteLLM proxy**.

@@ -162,7 +162,7 @@ async function renderGuide(main) {
   const goLabel = (where) => (where === "run" ? (latest ? "opens your latest finished run" : "opens your runs") : "");
 
   // ---- hero
-  const playBtn = h("button", { class: "btn" }, "▶ Play the 2-minute tour");
+  const playBtn = h("button", { class: "btn" }, "▶ Play the 20-second tour");
   root.append(h("section", { class: "g-hero" },
     h("div", { class: "g-tag mono" }, "Getting started"),
     h("h1", {}, "Find out which Bedrock model can replace your GPT model — ", h("em", {}, "before"), " you switch."),
@@ -237,15 +237,16 @@ async function renderGuide(main) {
     requestAnimationFrame(placePacket);  // again after layout settles (fonts, scrollbars)
     if (focus) nodes[cur].focus({ preventScroll: true });
   }
-  function stopTour() { if (tour) { clearInterval(tour); tour = null; } playBtn.textContent = "▶ Play the 2-minute tour"; }
+  function stopTour() { if (tour) { clearInterval(tour); tour = null; } playBtn.textContent = "▶ Play the 20-second tour"; }
   playBtn.addEventListener("click", () => {
     if (tour) return stopTour();
     show(0); playBtn.textContent = "❚❚ Pause the tour";
     root.querySelector(".g-pipe").scrollIntoView({ behavior: "smooth", block: "start" });
     tour = setInterval(() => {
       if (!alive()) return stopTour();
-      if (cur === GUIDE_STEPS.length - 1) stopTour(); else show(cur + 1);
-    }, 7000);
+      // Loop continuously: wrap from the last step back to the first.
+      show((cur + 1) % GUIDE_STEPS.length);
+    }, 2500);  // 8 steps x 2500ms = ~20s per full loop
   });
   prevBtn.addEventListener("click", () => { stopTour(); show(cur - 1); });
   nextBtn.addEventListener("click", () => { stopTour(); show(cur + 1); });

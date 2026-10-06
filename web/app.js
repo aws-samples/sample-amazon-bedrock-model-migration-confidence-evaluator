@@ -184,7 +184,52 @@ function newRunSource(main, d) {
       h("div", {}, h("div", { class: "muted", style: "margin-bottom:8px" }, "Upload file"), dz),
       h("div", {}, h("div", { class: "muted", style: "margin-bottom:8px" }, "or S3 location"),
         s3Input, h("button", { class: "btn secondary", style: "margin-top:8px", onclick: () => s3Ingest(main, d, s3Input.value) }, "Validate & ingest"))),
+    manualSourceBlock(main, d),
     preview));
+}
+
+// "Enter prompts manually": no log file — the user types one or more golden
+// request/response pairs that become the dataset. Posts manual_prompts to /ingest;
+// everything downstream (normalize, score, judge, aggregate) is unchanged.
+function manualSourceBlock(main, d) {
+  d.manualRows = d.manualRows && d.manualRows.length ? d.manualRows : [{ prompt: "", golden: "", instructions: "" }];
+  const list = h("div", {});
+  const taStyle = "width:100%;font:inherit;color:var(--text);background:var(--bg);border:1px solid var(--border);border-radius:var(--radius-sm);padding:8px;resize:vertical";
+
+  function renderRows() {
+    clear(list);
+    d.manualRows.forEach((row, i) => {
+      const promptTa = h("textarea", { rows: "3", placeholder: "Prompt sent to the model (the request)", style: taStyle,
+        oninput: e => { row.prompt = e.target.value; } });
+      promptTa.value = row.prompt || "";
+      const goldenTa = h("textarea", { rows: "3", placeholder: "Response your current model gave (the golden answer)", style: taStyle,
+        oninput: e => { row.golden = e.target.value; } });
+      goldenTa.value = row.golden || "";
+      const instrTa = h("textarea", { rows: "2", placeholder: "Optional system / developer instructions", style: taStyle,
+        oninput: e => { row.instructions = e.target.value; } });
+      instrTa.value = row.instructions || "";
+      const header = h("div", { class: "row spread", style: "margin-bottom:6px" },
+        h("span", { class: "muted mono", style: "font-size:12px" }, `Prompt ${i + 1}`),
+        d.manualRows.length > 1
+          ? h("button", { class: "btn ghost", style: "padding:2px 8px", onclick: () => { d.manualRows.splice(i, 1); renderRows(); } }, "Remove")
+          : null);
+      list.append(h("div", { class: "g-mini", style: "margin-bottom:10px;padding:10px" },
+        header,
+        h("label", { class: "field" }, h("span", {}, "Input prompt"), promptTa),
+        h("label", { class: "field", style: "margin-top:8px" }, h("span", {}, "Golden response"), goldenTa),
+        h("label", { class: "field", style: "margin-top:8px" }, h("span", {}, "Instructions (optional)"), instrTa)));
+    });
+  }
+  renderRows();
+
+  return h("details", { class: "card", style: "margin-top:12px;background:transparent" },
+    h("summary", { style: "cursor:pointer;font-weight:600" }, "or enter prompts manually (no log file)"),
+    h("div", { class: "muted", style: "margin:8px 0" },
+      "Type one or more golden request/response pairs. Each becomes an evaluation that is replayed against the candidate models — exactly like a logged request."),
+    list,
+    h("div", { class: "row", style: "gap:8px;margin-top:4px" },
+      h("button", { class: "btn secondary", onclick: () => { d.manualRows.push({ prompt: "", golden: "", instructions: "" }); renderRows(); } }, "+ Add another prompt"),
+      h("button", { class: "btn", onclick: () => manualIngest(main, d) }, "Use these prompts")));
 }
 
 async function ensureRun(d) {
@@ -217,6 +262,24 @@ async function s3Ingest(main, d, uri) {
     const ing = await api(`/runs/${d.runId}/ingest`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ s3_uri: uri }) });
     d.ingestion = ing.ingestion; showIngestion(d);
   } catch (e) { clear(pv); pv.append(h("div", { class: "banner err" }, "S3 ingestion failed: " + e.message)); }
+}
+
+async function manualIngest(main, d) {
+  const rows = (d.manualRows || [])
+    .map(r => ({ prompt: (r.prompt || "").trim(), golden: (r.golden || "").trim(), instructions: (r.instructions || "").trim() }))
+    .filter(r => r.prompt && r.golden);
+  const pv = $("#ingPreview"); clear(pv);
+  if (!rows.length) {
+    pv.append(h("div", { class: "banner err" }, "Enter at least one prompt with a golden response."));
+    return;
+  }
+  pv.append(h("div", { class: "skeleton" }));
+  try {
+    await ensureRun(d);
+    const ing = await api(`/runs/${d.runId}/ingest`, { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ manual_prompts: rows }) });
+    d.ingestion = ing.ingestion; showIngestion(d);
+  } catch (e) { clear(pv); pv.append(h("div", { class: "banner err" }, "Ingestion failed: " + (e && e.message ? e.message : "unknown error"))); }
 }
 
 function showIngestion(d) {
