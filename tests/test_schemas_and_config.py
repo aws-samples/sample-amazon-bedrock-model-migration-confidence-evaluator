@@ -72,15 +72,40 @@ def test_matrix_unmapped_returns_none():
 
 
 def test_estimate_cost_uses_output_rate_for_reasoning():
-    # 1000 input + 1000 output + 1000 reasoning tokens for luna
-    c = estimate_cost("gpt-5.6-luna", 1000, 1000, 1000)
-    # input 0.00022 + (output+reasoning 2000/1000 * 0.00132) = 0.00022 + 0.00264
-    assert abs(c - 0.00286) < 1e-9
+    # Bedrock reports reasoning as a SUBSET of output tokens: 1000 output (incl. 400 reasoning)
+    # is billed as 1000 output tokens, not 1400.
+    c = estimate_cost("gpt-5.6-luna", 1000, 1000, 400)
+    assert abs(c - (0.00022 + 1.0 * 0.00132)) < 1e-9
+    # If a source counts reasoning separately (reasoning > output), both are billed.
+    c2 = estimate_cost("gpt-5.6-luna", 1000, 100, 900)
+    assert abs(c2 - (0.00022 + 1.0 * 0.00132)) < 1e-9
 
 
-def test_gpt54_is_mantle_only_model_id():
-    # GPT-5.4 is bedrock-mantle only: model id has NO us. prefix.
-    assert MODEL_CATALOG["gpt-5.4"].bedrock_model_id == "openai.gpt-5.4"
+def test_price_table_matches_public_bedrock_rates():
+    # Public Bedrock model-card list prices, USD per 1M tokens (input, cache read, output).
+    expected = {
+        "gpt-5.6-luna": (0.22, 0.022, 1.32),
+        "gpt-5.6-terra": (2.20, 0.22, 13.20),
+        "gpt-5.6-sol": (4.40, 0.44, 22.00),
+        "gpt-5.5": (5.50, 0.55, 33.00),
+        "gpt-5.4": (2.75, 0.275, 16.50),
+    }
+    from modelshift.config import PRICE_TABLE
+    for model, (inp, cached, out) in expected.items():
+        p = PRICE_TABLE[model]
+        assert abs(p.input_per_1k * 1000 - inp) < 1e-9, model
+        assert abs(p.cache_read_per_1k * 1000 - cached) < 1e-9, model
+        assert abs(p.output_per_1k * 1000 - out) < 1e-9, model
+    # GPT-5.5 is no longer costed as $0
+    assert estimate_cost("gpt-5.5", 1000, 1000) > 0
+
+
+def test_gpt54_model_ids_runtime_and_mantle():
+    # GPT-5.4 is on bedrock-runtime via the us. inference profile, and on mantle via openai.*.
+    e = MODEL_CATALOG["gpt-5.4"]
+    assert e.bedrock_model_id == "us.openai.gpt-5.4"
+    assert e.mantle_model_id == "openai.gpt-5.4"
+    assert e.runtime_supported is True
 
 
 def test_rubric_bands():

@@ -10,7 +10,7 @@ import json
 import os
 from dataclasses import asdict
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from .orchestrator import (
     CandidateConfig,
@@ -56,6 +56,10 @@ def _run_to_dict(run: Run) -> Dict:
         "events": [asdict(e) for e in run.events],
         "error": run.error,
         "error_detail": run.error_detail,
+        "metrics_version": run.metrics_version,
+        "weights": run.weights.model_dump(mode="json"),
+        "created_at": run.created_at,
+        "exec_stats": run.exec_stats,
     }
 
 
@@ -79,12 +83,14 @@ def _config_from_dict(d: Dict) -> RunConfig:
         sampling_n=d.get("sampling_n", 200),
         sampling_seed=d.get("sampling_seed", 42),
         use_judge=d.get("use_judge", True),
-        parallelism=d.get("parallelism", 6),
+        parallelism=max(1, int(d.get("parallelism", 1) or 1)),
         dry_run=d.get("dry_run", False),
+        monthly_volume=d.get("monthly_volume"),
+        replays=max(1, min(5, int(d.get("replays", 1) or 1))),
     )
 
 
-def _run_from_dict(d: Dict) -> Run:
+def _run_from_dict(d: Dict, created_fallback: Optional[float] = None) -> Run:
     run = Run(run_id=d["run_id"], name=d.get("name", ""), description=d.get("description", ""))
     run.status = RunStatus(d.get("status", "created"))
     run.config = _config_from_dict(d["config"]) if d.get("config") else None
@@ -104,6 +110,26 @@ def _run_from_dict(d: Dict) -> Run:
                   for e in d.get("events", [])]
     run.error = d.get("error")
     run.error_detail = d.get("error_detail")
+    run.metrics_version = int(d.get("metrics_version", 1))
+    if isinstance(d.get("weights"), dict):
+        from .schemas import Weights
+        try:
+            run.weights = Weights(**d["weights"])
+        except (TypeError, ValueError):
+            pass  # keep the default (Balanced)
+    # Older runs have no created_at: use the first event, else the caller's fallback (file mtime).
+    run.exec_stats = d.get("exec_stats") if isinstance(d.get("exec_stats"), dict) else None
+    if run.exec_stats is None and run.config is not None and run.status in (RunStatus.DONE, RunStatus.FAILED,
+                                                                            RunStatus.CANCELLED):
+        # Finished before parallel calls existed: it ran one call at a time, whatever the
+        # (then unused) saved parallelism value says.
+        run.config.parallelism = 1
+    ca = d.get("created_at")
+    if isinstance(ca, (int, float)) and ca > 0:
+        run.created_at = float(ca)
+    else:
+        first = min((e.ts for e in run.events if e.ts), default=None)
+        run.created_at = first or created_fallback or run.created_at
     return run
 
 
@@ -118,7 +144,7 @@ def load_all_runs() -> Dict[str, Run]:
     out: Dict[str, Run] = {}
     for f in sorted(runs_dir().glob("*.json")):
         try:
-            out[f.stem] = _run_from_dict(json.loads(f.read_text()))
+            out[f.stem] = _run_from_dict(json.loads(f.read_text()), created_fallback=f.stat().st_mtime)
         except (ValueError, OSError, KeyError, TypeError):
             continue  # skip a corrupt/incompatible run file, don't crash boot
     return out

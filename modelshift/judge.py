@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from typing import Any, Callable, Dict, Optional, Protocol
 
 from .config import DEFAULT_RUBRIC, Rubric
@@ -71,7 +72,10 @@ class Judge:
         self._transport = transport
         self._rubric = rubric
         self._steering = steering
-        self._cache: Dict[str, Dict[str, Any]] = {}
+        from .concurrency import SingleFlight
+        # Thread-safe: concurrent workers judging the same answer make one judge call.
+        self._flight: "SingleFlight[Dict[str, Any]]" = SingleFlight()
+        self._cache: Dict[str, Dict[str, Any]] = self._flight.store
 
     def refine(self, sample: NormalizedSample, output: CandidateOutput, ps: PairScore) -> PairScore:
         """Apply judge adjudication to a deterministic PairScore (in place-ish, returns it)."""
@@ -87,14 +91,15 @@ class Judge:
             return ps
 
         key = _judge_cache_key(sample.id, ps.model, _cand_text(output), self._steering or "")
-        verdict = self._cache.get(key)
-        if verdict is None:
-            verdict = self._transport(judge_prompt(sample, output, self._steering))
-            self._cache[key] = verdict
+        verdict, _ = self._flight.get_or_compute(
+            key, lambda: self._transport(judge_prompt(sample, output, self._steering)))
 
         sem = float(verdict.get("semantic", ps.d1_semantic.score))
         instr = float(verdict.get("instruction", 1.0))
-        reason = verdict.get("reason") or "equivalent"
+        reason = verdict.get("reason")
+        if reason not in JUDGE_REASONS:
+            # Missing/unknown reason (e.g. unparseable judge reply): derive from the score.
+            reason = "equivalent" if sem >= 0.85 else "missing_content"
 
         # Judge upgrades/downgrades D1 (semantic) and sets D5 (instruction).
         ps.d1_semantic = DimensionScore(score=round(sem, 4), reason=f"judge:{reason}")
@@ -113,19 +118,18 @@ class Judge:
 
 def make_bedrock_judge_transport(model_id: str, region: str = "us-east-1") -> JudgeTransport:
     """Real Bedrock judge via Converse (lazy import). Expects a JSON verdict back."""
-    import boto3  # lazy
+    from .adapters import _boto_client
 
-    client = boto3.client("bedrock-runtime", region_name=region)
+    client = _boto_client(region)
 
     def _invoke(prompt: Dict[str, Any]) -> Dict[str, Any]:
         instruction = _judge_instruction(prompt)
         resp = client.converse(
             modelId=model_id,
             messages=[{"role": "user", "content": [{"text": instruction}]}],
-            inferenceConfig={"maxTokens": 512},
+            inferenceConfig={"maxTokens": 1024},
         )
-        text = resp["output"]["message"]["content"][0]["text"]
-        return _parse_judge_json(text)
+        return _parse_judge_json(_converse_text(resp))
 
     return _invoke
 
@@ -137,34 +141,76 @@ def _judge_instruction(prompt: Dict[str, Any]) -> str:
         "You are a strict migration-compatibility judge. Compare the CANDIDATE to the "
         "GOLDEN and return ONLY a JSON object with keys: semantic (0..1), instruction (0..1), "
         "factual_agree (true/false), reason (one of: equivalent, missing_content, "
-        "factual_divergence, format_change, added_verbosity, instruction_violation), rationale. "
+        "factual_divergence, format_change, added_verbosity, instruction_violation), rationale "
+        "(at most 2 sentences). "
         "If the payload includes an 'evaluation_steering' field, follow those custom evaluation "
         "instructions in addition to the default guidance.\n\n"
         + json.dumps(prompt)
     )
 
 
+_JUDGE_UNPARSED = "Judge reply could not be parsed; deterministic score kept."
+
+
 def _parse_judge_json(text: str) -> Dict[str, Any]:
-    start, end = text.find("{"), text.rfind("}")
-    return json.loads(text[start:end + 1]) if start >= 0 else {"semantic": 0.5, "reason": "equivalent"}
+    """Parse the judge's JSON verdict. NEVER raises: a malformed, truncated
+    (max-tokens) or prose-only reply must not abort the run.
+
+    Order: first complete JSON object in the text -> salvage of the scalar fields
+    from a truncated object -> {} (refine() then keeps the deterministic D1)."""
+    text = text or ""
+    decoder = json.JSONDecoder()
+    i = text.find("{")
+    while i >= 0:
+        try:
+            obj, _ = decoder.raw_decode(text, i)
+            if isinstance(obj, dict):
+                return obj
+        except ValueError:
+            pass
+        i = text.find("{", i + 1)
+    # Truncated object (no closing brace): salvage what was emitted.
+    salvaged: Dict[str, Any] = {}
+    for key in ("semantic", "instruction"):
+        m = re.search(rf'"{key}"\s*:\s*(-?\d+(?:\.\d+)?)', text)
+        if m:
+            salvaged[key] = max(0.0, min(1.0, float(m.group(1))))
+    m = re.search(r'"reason"\s*:\s*"([a-z_]+)"', text)
+    if m and m.group(1) in JUDGE_REASONS:
+        salvaged["reason"] = m.group(1)
+    m = re.search(r'"factual_agree"\s*:\s*(true|false)', text)
+    if m:
+        salvaged["factual_agree"] = m.group(1) == "true"
+    if salvaged:
+        salvaged["rationale"] = "Judge reply was truncated; parsed the fields it emitted."
+        return salvaged
+    return {"rationale": _JUDGE_UNPARSED}
+
+
+def _converse_text(resp: Dict[str, Any]) -> str:
+    """First text block of a Converse reply (skips reasoningContent blocks)."""
+    for block in resp.get("output", {}).get("message", {}).get("content", []) or []:
+        if isinstance(block, dict) and isinstance(block.get("text"), str):
+            return block["text"]
+    return ""
 
 
 def make_litellm_judge_transport(base_url: str, api_key: str, model: str) -> JudgeTransport:
     """Judge via the LiteLLM proxy (/v1/chat/completions) so judge traffic is also
     proxied through the gateway when a run's call path is LiteLLM. `model` is the
     LiteLLM model-group alias for the judge (e.g. 'claude-sonnet-4.5')."""
-    import httpx  # lazy
+    from .adapters import _shared_http_client
+    client = _shared_http_client()
 
     def _invoke(prompt: Dict[str, Any]) -> Dict[str, Any]:
         body = {"model": model,
                 "messages": [{"role": "user", "content": _judge_instruction(prompt)}],
-                "max_tokens": 512}
-        with httpx.Client(timeout=120) as client:
-            r = client.post(f"{base_url.rstrip('/')}/v1/chat/completions",
-                            headers={"Authorization": f"Bearer {api_key}"}, json=body)
-            if r.status_code >= 400:
-                raise RuntimeError(f"{r.status_code}: {r.text[:400]}")
-            data = r.json()
+                "max_tokens": 1024}
+        r = client.post(f"{base_url.rstrip('/')}/v1/chat/completions",
+                        headers={"Authorization": f"Bearer {api_key}"}, json=body)
+        if r.status_code >= 400:
+            raise RuntimeError(f"{r.status_code}: {r.text[:400]}")
+        data = r.json()
         text = (data.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
         return _parse_judge_json(text)
 

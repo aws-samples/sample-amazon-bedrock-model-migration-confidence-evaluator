@@ -16,7 +16,7 @@ from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from .config import DEFAULT_SETTINGS, MIGRATION_MATRIX, MODEL_CATALOG
+from .config import DEFAULT_SETTINGS, MIGRATION_MATRIX, MODEL_CATALOG, RECOMMENDATION_SETTING_KEYS
 from .ingest import ingest
 from .orchestrator import (
     CandidateConfig,
@@ -136,12 +136,53 @@ class RunConfigBody(BaseModel):
     filter_teams: Optional[List[str]] = None
     filter_users: Optional[List[str]] = None
     dry_run: bool = False
+    monthly_volume: Optional[int] = None  # expected production requests/month (optional)
+    weights: Optional["WeightsBody"] = None  # recommendation weights preset (or custom)
+    replays: int = 1  # send each request N times (1 = off; 2-5 when replays are on)
+    parallelism: Optional[Any] = None  # calls at once for this run; default = Settings (1-16)
+
+
+class WeightsBody(BaseModel):
+    """A preset name, or preset='custom' with quality/cost/latency (normalised server-side)."""
+    preset: str = "balanced"
+    quality: Optional[float] = None
+    cost: Optional[float] = None
+    latency: Optional[float] = None
+
+
+def _weights_from(body: Optional[WeightsBody]):
+    """Preset name -> that preset's weights; 'custom' -> the given numbers (normalised)."""
+    from .recommend import weights_for
+    from .schemas import Weights
+    if body is None:
+        return weights_for("balanced", DEFAULT_SETTINGS)
+    if body.preset == "custom":
+        return weights_for("custom", DEFAULT_SETTINGS, custom=Weights(
+            quality=body.quality or 0.0, cost=body.cost or 0.0, latency=body.latency or 0.0))
+    if body.preset not in DEFAULT_SETTINGS.weight_presets:
+        raise HTTPException(400, detail={"error": {"code": "invalid_weights",
+                            "message": (f"unknown preset {body.preset!r}; use one of "
+                                        f"{sorted(DEFAULT_SETTINGS.weight_presets)} or 'custom'")}})
+    return weights_for(body.preset, DEFAULT_SETTINGS)
+
+
+RunConfigBody.model_rebuild()
+
+
+def _rec_payload(r: Run, weights=None) -> Optional[Dict[str, Any]]:
+    """Fresh recommendation for a finished run, or None."""
+    if r.status != RunStatus.DONE or not r.verdicts:
+        return None
+    from .recommend import run_recommendation
+    rec = run_recommendation(r, DEFAULT_SETTINGS, weights)
+    return rec.model_dump(mode="json") if rec else None
 
 
 class OverrideBody(BaseModel):
     candidate: str
     label: CompatLabel
     note: str = ""
+    replay_index: int = 0   # which replay's answer to relabel (0 when replays are off)
 
 
 _UPLOADS: Dict[str, bytes] = {}
@@ -213,22 +254,89 @@ def rename_run(run_id: str, body: CreateRunBody):
 
 @app.get("/api/v1/runs")
 def list_runs():
-    return [{"run_id": r.run_id, "name": r.name, "status": r.status.value,
-             "verdict_summary": [{"model": v.model, "confidence": v.migration_confidence,
-                                  "band": v.verdict_band.value} for v in r.verdicts]}
-            for r in _RUNS.values()]
+    out = []
+    for r in _RUNS.values():
+        try:
+            out.append(_run_summary(r))
+        except Exception:  # noqa: BLE001 — one unreadable run must not hide all the others
+            out.append({"run_id": r.run_id, "name": r.name, "status": r.status.value,
+                        "created_at": r.created_at, "evaluations": None, "candidates_planned": 0,
+                        "verdict_summary": [], "best_overall": None, "none_eligible": False,
+                        "spend": None, "spend_unknown": False, "progress": None,
+                        "error": "This run's summary could not be read."})
+    return out
+
+
+def _run_summary(r: Run) -> Dict[str, Any]:
+    """One row of the Runs list: enough to show status, recommendation, spread and spend."""
+    best, none_eligible = None, False
+    if r.status == RunStatus.DONE and r.verdicts:
+        try:
+            rec = _rec_payload(r) or {}
+            none_eligible = bool(rec.get("none_eligible"))
+            if not none_eligible:
+                best = next((p.get("model") for p in rec.get("profiles", [])
+                             if p.get("kind") == "best_overall"), None)
+        except Exception:  # noqa: BLE001 — a bad run must not break the whole list
+            best = None
+    known = [x.cost_estimate for x in r.results if x.cost_known]
+    progress = None
+    if r.status in (RunStatus.PLANNING, RunStatus.REPLAYING, RunStatus.SCORING, RunStatus.AGGREGATING):
+        plan = next((e for e in r.events if e.type == "plan"), None)
+        last = next((e for e in reversed(r.events) if e.type == "progress"), None)
+        progress = {"done": last.data.get("done", 0) if last else 0,
+                    "total": ((last.data.get("total") if last else None)
+                              or (plan.data.get("estimated_calls") if plan else 0)),
+                    "started_ts": plan.ts if plan else None,
+                    "last_ts": last.ts if last else None,
+                    "stage": r.status.value}
+        es = r.exec_stats or {}
+        par = r.config.parallelism if r.config else 1
+        eff = list((es.get("effective") or {}).values())
+        progress.update({"parallelism": par, "inflight": es.get("inflight", 0),
+                         "throttles": es.get("throttles", 0),
+                         "throttled": bool(eff) and min(eff) < par})
+    return {
+        "run_id": r.run_id, "name": r.name, "status": r.status.value,
+        "created_at": r.created_at,
+        "evaluations": r.ingestion.evaluable if r.ingestion else len(r.samples),
+        "candidates_planned": len(r.config.candidates) if r.config else 0,
+        "replays": _run_replays(r),
+        "verdict_summary": [{"model": v.model, "confidence": v.migration_confidence,
+                             "band": v.verdict_band.value, "eligible": v.eligible} for v in r.verdicts],
+        "best_overall": best,
+        "none_eligible": none_eligible,
+        "spend": round(sum(known), 6) if r.results else None,
+        "spend_unknown": any(not x.cost_known for x in r.results if x.status == "ok"),
+        "error": (r.error or "")[:300] or None,
+        "progress": progress,
+    }
 
 
 @app.get("/api/v1/runs/{run_id}")
 def get_run(run_id: str):
     r = _get_run(run_id)
+    rec = _rec_payload(r)  # also refreshes r.verdicts
     return {
         "run_id": r.run_id, "name": r.name, "status": r.status.value,
         "ingestion": r.ingestion.model_dump() if r.ingestion else None,
         "candidates": [v.model for v in r.verdicts],
         "error": r.error,
         "error_detail": r.error_detail,
+        "weights": r.weights.model_dump(mode="json"),
+        "recommendation": rec,
+        "replays": _run_replays(r),
+        "parallelism": r.config.parallelism if r.config else 1,
+        "exec_stats": r.exec_stats,
     }
+
+
+@app.get("/api/v1/concurrency")
+def get_concurrency():
+    """Server-wide calls in flight vs the cap, and each live run's in-flight / limit."""
+    from .concurrency import concurrency_snapshot, server_slots
+    server_slots(DEFAULT_SETTINGS.max_inflight_calls)
+    return concurrency_snapshot()
 
 
 def _rows_from_manual_prompts(items: List["ManualPrompt"]) -> List[Dict[str, Any]]:
@@ -276,13 +384,24 @@ def ingest_run(run_id: str, body: IngestBody):
         data = _UPLOADS.get(body.upload_id)
         if data is None:
             raise HTTPException(400, detail={"error": {"code": "not_found", "message": "upload not found"}})
-        res = ingest([(data, f"upload:{body.upload_id}")])
+        from .sources import is_zip, load_zip_bytes, ZipArchiveError
+        if is_zip(data):
+            # A zip of (nested) folders of log files -> one consolidated run.
+            try:
+                objects, skipped = load_zip_bytes(data, f"upload:{body.upload_id}")
+            except ZipArchiveError as e:
+                raise HTTPException(400, detail={"error": {"code": "invalid_zip", "message": str(e)}})
+            res = ingest(objects, skipped_objects=skipped)
+        else:
+            res = ingest([(data, f"upload:{body.upload_id}")])
     elif body.s3_uri:
-        from .sources import load_s3, S3UriError
+        from .sources import load_s3, S3UriError, ZipArchiveError
         try:
             objects, skipped = load_s3(body.s3_uri)
         except S3UriError as e:
             raise HTTPException(400, detail={"error": {"code": "invalid_s3_uri", "message": str(e)}})
+        except ZipArchiveError as e:
+            raise HTTPException(400, detail={"error": {"code": "invalid_zip", "message": str(e)}})
         res = ingest(objects, skipped_objects=skipped)
     else:
         raise HTTPException(400, detail={"error": {"code": "conflict",
@@ -342,8 +461,13 @@ def get_source_summary(run_id: str):
 
 def _resolve_config(r: Run, body: RunConfigBody) -> RunConfig:
     if body.candidates:
-        cands = [CandidateConfig(model=c.model, reasoning_effort=c.reasoning_effort)
-                 for c in body.candidates]
+        cands = []
+        seen = set()
+        for c in body.candidates:
+            cc = CandidateConfig(model=c.model, reasoning_effort=c.reasoning_effort)
+            if cc.label not in seen:  # same model + same effort twice = one candidate
+                seen.add(cc.label)
+                cands.append(cc)
     else:
         legacy = r.ingestion.detected_models[0].model if (r.ingestion and r.ingestion.detected_models) else None
         cands = default_candidates_for(legacy)
@@ -356,8 +480,19 @@ def _resolve_config(r: Run, body: RunConfigBody) -> RunConfig:
     if not cands:
         raise HTTPException(400, detail={"error": {"code": "conflict",
                                                    "message": "no candidate models available"}})
+    from .config import supported_efforts
+    bad = []
+    for c in cands:
+        ok = supported_efforts(c.model)
+        if ok is not None and c.reasoning_effort.value not in ok:
+            bad.append(f"{c.model} does not support reasoning effort '{c.reasoning_effort.value}' "
+                       f"(supported: {', '.join(ok)})")
+    if bad:
+        # Fail before replaying anything: Bedrock would reject every call with a 400.
+        raise HTTPException(400, detail={"error": {"code": "unsupported_reasoning_effort",
+                                                   "message": "; ".join(bad)}})
     endpoint = body.bedrock_endpoint
-    # GPT-5.4 (and any runtime-unsupported model) is mantle-only — force it.
+    # A runtime-unsupported (mantle-only) model forces the mantle endpoint.
     if body.call_path == CallPath.BEDROCK and any(
         (MODEL_CATALOG.get(c.model) and not MODEL_CATALOG[c.model].runtime_supported) for c in cands
     ):
@@ -368,7 +503,29 @@ def _resolve_config(r: Run, body: RunConfigBody) -> RunConfig:
         sampling_seed=body.sampling_seed, use_judge=body.use_judge, dry_run=body.dry_run,
         judge_steering=body.judge_steering,
         filter_teams=body.filter_teams, filter_users=body.filter_users,
+        monthly_volume=body.monthly_volume if (body.monthly_volume or 0) > 0 else None,
+        replays=_valid_replays(body.replays),
+        parallelism=_valid_parallelism(body.parallelism),
     )
+
+
+def _valid_parallelism(n: Any) -> int:
+    """Run's parallel calls: the API override if given (1-16), else the current Settings value."""
+    if n is None:
+        return DEFAULT_SETTINGS.default_parallelism
+    if isinstance(n, bool) or not isinstance(n, int) or not 1 <= n <= 16:
+        raise HTTPException(400, detail={"error": {
+            "code": "invalid_parallelism",
+            "message": "parallelism must be a whole number between 1 and 16"}})
+    return n
+
+
+def _valid_replays(n: Any) -> int:
+    if isinstance(n, bool) or not isinstance(n, int) or not 1 <= n <= 5:
+        raise HTTPException(400, detail={"error": {
+            "code": "invalid_replays",
+            "message": "replays must be between 1 and 5 (1 = off; 2-5 sends each request that many times)"}})
+    return n
 
 
 @app.post("/api/v1/runs/{run_id}/plan")
@@ -377,6 +534,8 @@ def plan_run(run_id: str, body: RunConfigBody):
     if not r.samples:
         raise HTTPException(409, detail={"error": {"code": "conflict", "message": "ingest first"}})
     r.config = _resolve_config(r, body)
+    if body.weights is not None:
+        r.weights = _weights_from(body.weights)
     return _ORCH.plan(r)
 
 
@@ -388,6 +547,8 @@ def launch_run(run_id: str, body: RunConfigBody):
     if body.name:
         r.name = body.name
     r.config = _resolve_config(r, body)
+    if body.weights is not None:
+        r.weights = _weights_from(body.weights)
     _CANCEL[run_id] = False
     run_async(_ORCH, r, _CANCEL, on_complete=_save_run)
     return {"status": RunStatus.REPLAYING.value}
@@ -416,6 +577,7 @@ def delete_run(run_id: str):
 @app.get("/api/v1/runs/{run_id}/results")
 def get_results(run_id: str):
     r = _get_run(run_id)
+    rec = _rec_payload(r)  # refreshes r.verdicts from stored results first
     # All distinct per-call errors (model + message), not just the first, so the
     # UI can show every failing candidate/reason.
     sample_errors = []
@@ -432,7 +594,56 @@ def get_results(run_id: str):
             "error": r.error,
             "error_detail": r.error_detail,   # full traceback for a run-level failure
             "sample_error": (sample_errors[0]["error"] if sample_errors else None),  # back-compat
-            "sample_errors": sample_errors}
+            "sample_errors": sample_errors,
+            "weights": r.weights.model_dump(mode="json"),
+            "recommendation": rec,
+            "replays": _run_replays(r),
+            "parallelism": r.config.parallelism if r.config else 1,
+            "exec_stats": r.exec_stats,
+            "exec_summary": _exec_summary(r.exec_stats)}
+
+
+def _exec_summary(stats):
+    from .concurrency import exec_summary
+    return exec_summary(stats)
+
+
+@app.get("/api/v1/runs/{run_id}/candidates/{candidate}/consistency")
+def least_consistent(run_id: str, candidate: str, limit: int = 10):
+    """Least consistent requests for a candidate (lowest D7 first). Empty when replays are off."""
+    r = _get_run(run_id)
+    cand = _resolve_candidate(r, candidate)
+    rows = [v for (m, _), v in _request_consistency_map(r, {cand}).items() if m == cand and v.get("d7") is not None]
+    rows.sort(key=lambda v: (v["d7"], v["sample_id"]))
+    prev = {s.id: _prompt_preview(s)[:140] for s in r.samples}
+    for v in rows:
+        v["prompt_preview"] = prev.get(v["sample_id"], "")
+    return {"candidate": cand, "replays": _run_replays(r), "items": rows[:max(1, min(limit, 100))],
+            "measured": len(rows)}
+
+
+@app.put("/api/v1/runs/{run_id}/weights")
+def put_run_weights(run_id: str, body: WeightsBody):
+    """Change the recommendation weights for a finished run. Re-ranks from stored results:
+    never calls a model."""
+    r = _get_run(run_id)
+    if r.status != RunStatus.DONE or not r.verdicts:
+        raise HTTPException(409, detail={"error": {"code": "not_ready",
+                            "message": f"run is {r.status.value}; weights apply once the run is done"}})
+    r.weights = _weights_from(body)
+    _save_run(r)
+    return {"weights": r.weights.model_dump(mode="json"), "recommendation": _rec_payload(r)}
+
+
+@app.get("/api/v1/runs/{run_id}/recommendation")
+def get_run_recommendation(run_id: str, preset: Optional[str] = None):
+    """The run's recommendation, or a preview under another preset (not saved)."""
+    r = _get_run(run_id)
+    if r.status != RunStatus.DONE or not r.verdicts:
+        raise HTTPException(409, detail={"error": {"code": "not_ready",
+                            "message": f"run is {r.status.value}; recommendation available once the run is done"}})
+    w = _weights_from(WeightsBody(preset=preset)) if preset else None
+    return _rec_payload(r, w)
 
 
 @app.get("/api/v1/runs/{run_id}/report.pdf")
@@ -470,28 +681,61 @@ def _caveats(r: Run) -> List[str]:
 
 @app.get("/api/v1/runs/{run_id}/samples")
 def get_samples(run_id: str, label: Optional[str] = None, candidate: Optional[str] = None,
-                limit: int = 100, offset: int = 0):
+                limit: int = 100, offset: int = 0, unstable: bool = False):
     r = _get_run(run_id)
     items = r.pair_scores
     if candidate:
+        candidate = _resolve_candidate(r, candidate)
         items = [p for p in items if p.model == candidate]
     if label:
         items = [p for p in items if p.label.value == label]
+    # Replays: attach each request's D7 so the list can show / filter unstable requests.
+    rc = _request_consistency_map(r, {p.model for p in items})
+    if unstable:
+        items = [p for p in items if (rc.get((p.model, p.sample_id)) or {}).get("unstable")]
     total = len(items)
     page = items[offset: offset + limit]
-    return {"items": [p.model_dump() for p in page], "total": total}
+    out = []
+    for p in page:
+        d = p.model_dump()
+        c = rc.get((p.model, p.sample_id))
+        d["replays"] = _run_replays(r)
+        d["consistency"] = c
+        out.append(d)
+    return {"items": out, "total": total}
+
+
+def _run_replays(r: Run) -> int:
+    return max(1, int(getattr(r.config, "replays", 1) or 1)) if r.config else 1
+
+
+def _request_consistency_map(r: Run, models) -> Dict[tuple, Dict[str, Any]]:
+    """(model, sample_id) -> D7 summary for runs with replays; {} when replays are off."""
+    if _run_replays(r) < 2:
+        return {}
+    from .consistency import requests_for
+    out: Dict[tuple, Dict[str, Any]] = {}
+    for m in models:
+        for rc in requests_for(m, r.results, r.pair_scores, DEFAULT_SETTINGS.instability_threshold):
+            out[(m, rc.sample_id)] = rc.model_dump(mode="json")
+    return out
 
 
 @app.get("/api/v1/runs/{run_id}/samples/{sample_id}")
-def get_sample_detail(run_id: str, sample_id: str, candidate: str):
+def get_sample_detail(run_id: str, sample_id: str, candidate: str, replay: int = 0):
     """Full drill-down for one (sample, candidate): original request/response/model/
-    latency + the candidate's rendered request, response, and latency + the scores."""
+    latency + the candidate's rendered request, response, and latency + the scores.
+    With replays, `replay` picks which answer is shown; `answers` lists all of them."""
     r = _get_run(run_id)
     sample = next((s for s in r.samples if s.id == sample_id), None)
     if sample is None:
         raise HTTPException(404, detail={"error": {"code": "not_found", "message": "sample not found"}})
-    result = next((x for x in r.results if x.sample_id == sample_id and x.model == candidate), None)
-    score = next((p for p in r.pair_scores if p.sample_id == sample_id and p.model == candidate), None)
+    candidate = _resolve_candidate(r, candidate)
+    mine = [x for x in r.results if x.sample_id == sample_id and x.model == candidate]
+    my_scores = [p for p in r.pair_scores if p.sample_id == sample_id and p.model == candidate]
+    result = next((x for x in mine if x.replay_index == replay), None) or (mine[0] if mine else None)
+    shown = result.replay_index if result is not None else replay
+    score = next((p for p in my_scores if p.replay_index == shown), None)
 
     # The candidate saw the same request as the golden (that's the point of a replay).
     original = {
@@ -519,9 +763,26 @@ def get_sample_detail(run_id: str, sample_id: str, candidate: str):
             "status": result.status,
             "error": result.error,
         }
+    answers = []
+    if _run_replays(r) > 1:
+        sc_by = {p.replay_index: p for p in my_scores}
+        for x in sorted(mine, key=lambda x: x.replay_index):
+            p = sc_by.get(x.replay_index)
+            answers.append({
+                "replay_index": x.replay_index, "status": x.status, "error": x.error,
+                "text": x.output.text if x.output else None,
+                "tool_calls": [tc.model_dump() for tc in ((x.output.tool_calls if x.output else None) or [])],
+                "latency_ms": x.latency_ms, "cost_estimate": x.cost_estimate,
+                "label": ((p.override_label if p.overridden and p.override_label else p.label).value
+                          if p else None),
+                "hard_break": p.hard_break if p else None,
+            })
+    consistency = _request_consistency_map(r, {candidate}).get((candidate, sample_id))
     return {"sample_id": sample_id, "candidate": candidate,
             "original": original, "candidate_result": cand,
-            "score": score.model_dump() if score else None}
+            "score": score.model_dump() if score else None,
+            "replay": shown, "replays": _run_replays(r),
+            "answers": answers, "consistency": consistency}
 
 
 def _prompt_preview(sample) -> str:
@@ -535,21 +796,26 @@ def get_transcript(run_id: str, candidate: str, limit: int = 25, offset: int = 0
     inline and paginated — original request + original response + candidate
     response (including errored candidate calls), with the per-row label/latency."""
     r = _get_run(run_id)
-    results_by_id = {res.sample_id: res for res in r.results if res.model == candidate}
-    scores_by_id = {p.sample_id: p for p in r.pair_scores if p.model == candidate}
-    # Every evaluable sample that was replayed against this candidate.
-    ids = [s.id for s in r.samples if s.id in results_by_id or s.id in scores_by_id]
+    candidate = _resolve_candidate(r, candidate)
+    results_by_id = {(res.sample_id, res.replay_index): res for res in r.results if res.model == candidate}
+    scores_by_id = {(p.sample_id, p.replay_index): p for p in r.pair_scores if p.model == candidate}
+    # Every evaluable sample that was replayed against this candidate, one row per replay.
+    keys = set(results_by_id) | set(scores_by_id)
+    order = {s.id: i for i, s in enumerate(r.samples)}
+    ids = sorted((k for k in keys if k[0] in order), key=lambda k: (order[k[0]], k[1]))
     total = len(ids)
     page_ids = ids[offset: offset + limit]
     samples_by_id = {s.id: s for s in r.samples}
 
     items = []
-    for sid in page_ids:
+    for key in page_ids:
+        sid, rep = key
         s = samples_by_id[sid]
-        res = results_by_id.get(sid)
-        sc = scores_by_id.get(sid)
+        res = results_by_id.get(key)
+        sc = scores_by_id.get(key)
         items.append({
             "sample_id": sid,
+            "replay_index": rep,
             "original_model": s.legacy_model,
             "request": {"instructions": s.request.instructions,
                         "messages": [m.model_dump() for m in s.request.input_messages]},
@@ -573,8 +839,9 @@ def get_transcript(run_id: str, candidate: str, limit: int = 25, offset: int = 0
 @app.patch("/api/v1/runs/{run_id}/samples/{sample_id}")
 def override_sample(run_id: str, sample_id: str, body: OverrideBody):
     r = _get_run(run_id)
+    cand = _resolve_candidate(r, body.candidate)
     for p in r.pair_scores:
-        if p.sample_id == sample_id and p.model == body.candidate:
+        if p.sample_id == sample_id and p.model == cand and p.replay_index == body.replay_index:
             p.overridden = True
             p.override_label = body.label
             p.override_note = body.note
@@ -583,9 +850,24 @@ def override_sample(run_id: str, sample_id: str, body: OverrideBody):
     raise HTTPException(404, detail={"error": {"code": "not_found", "message": "pair not found"}})
 
 
+def _resolve_candidate(r: Run, name: Optional[str]) -> Optional[str]:
+    """Map a ?candidate= value to the run's candidate key.
+
+    Candidates are keyed 'model@effort'. A bare model name ('gpt-5.6-luna') still works when
+    exactly one candidate in the run uses that model, so existing links and scripts keep working.
+    """
+    if not name:
+        return name
+    keys = {x.model for x in r.results} | {p.model for p in r.pair_scores} | {v.model for v in r.verdicts}
+    if name in keys:
+        return name
+    matches = [c.label for c in (r.config.candidates if r.config else []) if c.model == name]
+    return matches[0] if len(matches) == 1 else name
+
+
 def _candidate_effort(r: Run, model: str) -> ReasoningEffort:
     for c in (r.config.candidates if r.config else []):
-        if c.model == model:
+        if c.matches(model):
             return c.reasoning_effort
     return ReasoningEffort.MEDIUM
 
@@ -605,6 +887,7 @@ def get_remediations(run_id: str, candidate: Optional[str] = None):
         _save_run(r)
     rems = r.remediations
     if candidate:
+        candidate = _resolve_candidate(r, candidate)
         rems = [x for x in rems if x.candidate == candidate]
     return [x.model_dump() for x in rems]
 
@@ -636,7 +919,7 @@ def edit_remediation(run_id: str, remediation_id: str, body: RemediationEditBody
     if body.placement is not None:
         ch.placement = body.placement
     try:
-        rem.change = validate_change(ch)
+        rem.change = validate_change(ch, rem.candidate)
     except ValueError as e:
         raise HTTPException(400, detail={"error": {"code": "invalid_change", "message": str(e)}})
     # An edited change invalidates any earlier re-test result.
@@ -675,7 +958,7 @@ def _retest_change(r: Run, rem, body: Optional["RemediationEditBody"]):
         if body.placement is not None:
             ch.placement = body.placement
     try:
-        return validate_change(ch)
+        return validate_change(ch, rem.candidate)
     except ValueError as e:
         raise HTTPException(400, detail={"error": {"code": "invalid_change", "message": str(e)}})
 
@@ -777,7 +1060,7 @@ def stream_progress(run_id: str):
                 while idx < len(r.events):
                     ev = r.events[idx]
                     idx += 1
-                    yield f"event: {ev.type}\ndata: {json.dumps(ev.data)}\n\n"
+                    yield f"event: {ev.type}\ndata: {json.dumps({**ev.data, 'ts': ev.ts})}\n\n"
                 if r.status in terminal and idx >= len(r.events):
                     yield f"event: end\ndata: {json.dumps({'status': r.status.value})}\n\n"
                     return
@@ -799,9 +1082,15 @@ def get_settings():
             "judge_litellm_model": s.judge_litellm_model,
             "price_table": {k: v.model_dump() for k, v in s.price_table.items()},
             "parallelism": s.default_parallelism,
+            "concurrency": {"parallelism": s.default_parallelism, "max_parallelism": 16,
+                            "adaptive_concurrency": s.adaptive_concurrency,
+                            "max_inflight_calls": s.max_inflight_calls,
+                            "fail_fast_error_share": s.fail_fast_error_share},
             "small_sample_threshold": s.small_sample_threshold,
             "high_redaction_threshold": s.high_redaction_threshold,
             "litellm_base": s.litellm_base,
+            "recommendation": {k: getattr(s, k) for k in RECOMMENDATION_SETTING_KEYS},
+            "latency_disclaimer": s.latency_disclaimer,
             # Never return the key itself — only whether one is available. Cheap
             # presence check (no live Secrets Manager fetch on every settings read):
             # env var set, OR an SM secret ARN configured, OR a persisted key.
@@ -820,11 +1109,16 @@ class SettingsBody(BaseModel):
     default_reasoning_effort: Optional[ReasoningEffort] = None
     judge_model: Optional[str] = None
     judge_litellm_model: Optional[str] = None
-    parallelism: Optional[int] = None
+    parallelism: Optional[Any] = None     # validated strictly in update_settings (400 on non-integers)
+    adaptive_concurrency: Optional[bool] = None
+    max_inflight_calls: Optional[Any] = None
+    fail_fast_error_share: Optional[Any] = None   # null switches fail-fast off (when sent explicitly)
     small_sample_threshold: Optional[int] = None
     high_redaction_threshold: Optional[float] = None
     price_table: Optional[Dict[str, PriceBody]] = None
     litellm_base: Optional[str] = None
+    # Recommendation thresholds / presets (any subset; validated in update_settings).
+    recommendation: Optional[Dict[str, Any]] = None
     # Secret: send a new value to set/replace it; omit (null) to keep the existing
     # key; send an empty string "" to explicitly clear it.
     litellm_key: Optional[str] = None
@@ -844,8 +1138,28 @@ def update_settings(body: SettingsBody):
     if body.judge_litellm_model is not None:
         s.judge_litellm_model = body.judge_litellm_model.strip()
         litellm_changed = True
-    if body.parallelism is not None:
-        s.default_parallelism = max(1, min(body.parallelism, 32))
+    conc: Dict[str, Any] = {}
+    for k in ("parallelism", "max_inflight_calls"):
+        v = getattr(body, k)
+        if v is not None:
+            if isinstance(v, bool) or not isinstance(v, int):
+                raise HTTPException(400, detail={"error": {
+                    "code": "invalid_parallelism", "message": f"{k} must be a whole number"}})
+            conc["default_parallelism" if k == "parallelism" else k] = v
+    if body.adaptive_concurrency is not None:
+        conc["adaptive_concurrency"] = body.adaptive_concurrency
+    if "fail_fast_error_share" in body.model_fields_set:
+        v = body.fail_fast_error_share
+        if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float))):
+            raise HTTPException(400, detail={"error": {
+                "code": "invalid_setting",
+                "message": "fail_fast_error_share must be a number between 0 and 1, or null"}})
+        conc["fail_fast_error_share"] = v
+    if conc:
+        from .config import apply_concurrency_settings
+        from .concurrency import server_slots
+        apply_concurrency_settings(s, conc)
+        server_slots(s.max_inflight_calls)  # resize the live cap
     if body.small_sample_threshold is not None:
         s.small_sample_threshold = max(0, body.small_sample_threshold)
     if body.high_redaction_threshold is not None:
@@ -853,10 +1167,15 @@ def update_settings(body: SettingsBody):
     if body.price_table is not None:
         from .config import ModelPrice
         for model, p in body.price_table.items():
-            s.price_table[model] = ModelPrice(input_per_1k=p.input_per_1k, output_per_1k=p.output_per_1k)
+            prev = s.price_table.get(model)
+            s.price_table[model] = ModelPrice(input_per_1k=p.input_per_1k, output_per_1k=p.output_per_1k,
+                                              cache_read_per_1k=prev.cache_read_per_1k if prev else None)
     if body.litellm_base is not None:
         s.litellm_base = body.litellm_base.strip()
         litellm_changed = True
+    if body.recommendation:
+        from .config import _apply_recommendation_settings
+        _apply_recommendation_settings(s, body.recommendation)
     if body.litellm_key is not None:  # explicit set (may be "" to clear)
         s.litellm_key = body.litellm_key
         litellm_changed = True

@@ -45,11 +45,11 @@ def test_build_run_report_structure():
     # candidates + best
     assert rep["candidates"], "expected at least one candidate verdict"
     c0 = rep["candidates"][0]
-    assert c0["model"] == "gpt-5.6-luna"
+    assert c0["model"] == "gpt-5.6-luna@medium"
     assert c0["endpoint"] in ("bedrock-runtime", "bedrock-mantle", "litellm")
     assert 0 <= c0["migration_confidence"] <= 100
     assert "dimension_averages" in c0 and "distribution" in c0
-    assert rep["best"]["model"] == "gpt-5.6-luna"
+    assert rep["best"]["model"] == "gpt-5.6-luna@medium"
     # collections present (possibly empty)
     assert isinstance(rep["remediations"], list)
     assert isinstance(rep["caveats"], list)

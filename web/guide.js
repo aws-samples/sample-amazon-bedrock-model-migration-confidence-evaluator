@@ -25,7 +25,7 @@ const gBar = (label, v) => {
 const GUIDE_STEPS = [
   { k: "logs", t: "Bring your logs", where: "new",
     why: "Upload a LiteLLM log export or point at an S3 prefix. ModelShift turns every logged request into an evaluation it can replay, and tells you which rows it had to skip.",
-    pts: ["<b>Upload</b> a JSON / JSONL export, or enter an <b>S3 URI</b>",
+    pts: ["<b>Upload</b> a JSON / JSONL export, a <b>.zip</b> of log folders (merged into one run), or enter an <b>S3 URI</b>",
       "See rows <b>found</b>, <b>evaluable</b> and <b>dropped</b> — with the reason (redacted, tool calls, empty)",
       "It detects the <b>model you use today</b> and the <b>teams</b> and <b>users</b> in the logs"],
     decide: "Is this the traffic you want to migrate?", go: "New Run → 1 · Source",
@@ -42,20 +42,25 @@ const GUIDE_STEPS = [
       <div class="g-mini" style="margin-top:12px"><div class="muted" style="font-size:12px">Limit records</div>
       <div class="row spread" style="margin-top:4px"><span class="mono">200</span><span class="muted mono">of 640 matching</span></div></div>` },
   { k: "config", t: "Choose candidates", where: "new",
-    why: "Pick where calls go and which newer models to try. The models we recommend for the one you're replacing are pre-selected.",
+    why: "Pick where calls go and which newer models to try. The models we recommend for the one you're replacing are pre-selected. This is also where you teach the judge what compatibility means for your use case.",
     pts: ["Endpoint: <b>Bedrock Runtime</b>, <b>Bedrock Mantle</b>, or your <b>LiteLLM proxy</b> (its models are listed automatically)",
       "Candidates, including a <b>cross-family</b> baseline, and <b>reasoning effort</b>",
-      "Optional <b>judge steering</b>: tell the AI judge what matters for your use case",
+      "<b>Replay requests</b> (optional): send each request 2–5 times to check the model answers <i>consistently</i>. Multiplies calls and cost",
+      "<b>Judge steering / Skills</b>: type guidance inline or upload a <b>.md / .txt</b> Skill doc so the AI judge scores against <i>your</i> rules — e.g. a changed dosage or ID is a dealbreaker, a reworded greeting is fine",
       "Check the <b>number of calls and estimated cost</b> before you launch"],
     decide: "Which models, and what must the judge be strict about?", go: "New Run → 2 · Configuration",
     pv: `<div class="g-cap">Candidates</div>
       <div class="g-mini row spread g-sel"><b>gpt-5.6-luna</b><span class="muted" style="font-size:11px">recommended start</span></div>
       <div class="g-mini row spread" style="margin-top:6px"><b>gpt-5.6-terra</b><span class="muted" style="font-size:11px">candidate</span></div>
       <div class="g-mini row spread" style="margin-top:6px"><b>claude-sonnet-4.5</b><span class="muted" style="font-size:11px">cross-family</span></div>
+      <div class="g-cap" style="margin-top:12px">Judge steering / Skill</div>
+      <div class="g-mini" style="font-size:11.5px;line-height:1.5">&ldquo;Treat any change to a <b>dosage</b> or <b>member ID</b> as Incompatible. Ignore greeting style.&rdquo;
+      <span class="muted">— typed, or uploaded as a .md / .txt Skill</span></div>
       <div class="muted mono" style="margin-top:10px">≈ 600 calls · est. $1.84</div>` },
   { k: "run", t: "Replay", where: "run",
     why: "Every request is sent to every candidate exactly as your app sent it. Progress is live; if a call fails you see the full error, and failed calls are left out of the scores rather than guessed.",
-    pts: ["<b>Live progress</b> per candidate", "Show <b>errors only</b> to spot access or quota problems fast",
+    pts: ["<b>Live progress</b> per candidate",
+      "Calls are sent <b>several at a time</b> (Settings → Parallel calls). If Bedrock throttles, ModelShift slows down on its own and shows it", "Show <b>errors only</b> to spot access or quota problems fast",
       "<b>Cancel</b> any time; the full error and stack trace are kept"],
     decide: "Is anything failing for every request (access, quota)?", go: "Run details → Progress",
     pv: `<div class="g-cap">Live log</div><div class="g-log"><div>✓ gpt-5.6-luna · req_0412 · 812 ms</div><div>✓ gpt-5.6-terra · req_0412 · 1.2 s</div>
@@ -64,14 +69,18 @@ const GUIDE_STEPS = [
   { k: "score", t: "Score every answer", where: "run",
     why: "Each candidate answer is compared with the answer your current model gave, on six checks. An AI judge explains its verdict in plain words.",
     pts: ["<b>D1–D6</b>: meaning, format, facts, length, instructions, tool calls",
+      "With replays, every answer is scored like a normal call, and <b>D7 Consistency</b> scores how alike the answers to the same request are. D7 never changes a label or Migration Confidence; optional gates in Settings can require it",
+      "Your <b>judge steering / Skill</b> from the Configuration step shapes these judgment calls — but it can't override a hard break",
       "A <b>hard break</b> — broken format, a wrong fact, or a mismatched tool call — makes the answer Incompatible",
       "Each answer is labelled <b>Compatible</b>, <b>Compatible w/ drift</b>, <b>Partial</b> or <b>Incompatible</b>"],
     decide: "Do the judge's reasons match what your users care about?", go: "Results → View evaluations",
     pv: `<div class="g-cap">One evaluation</div>${gBar("D1 Meaning", 0.92)}${gBar("D2 Format", 1)}${gBar("D3 Facts", 0.55)}${gBar("D4 Length", 0.78)}
       <span class="pill incompatible" style="margin-top:8px">Incompatible · hard break</span>` },
   { k: "compare", t: "Compare candidates", where: "run",
-    why: "Each candidate gets a Migration Confidence score and a verdict. From there you can open any evaluation to see exactly how the two answers differ.",
-    pts: ["<b>Result cards</b>: confidence, the label mix, and per-check bars", "<b>Side-by-side</b>: confidence, hard breaks, cost, latency",
+    why: "Each candidate gets a Migration Confidence score and a verdict. On top of that, a Recommendation weighs quality, cost and latency to name the best model all things considered, plus the most economical, fastest and highest-quality options and what each trades off. From there you can open any evaluation to see exactly how the two answers differ.",
+    pts: ["<b>Recommendation</b>: best overall, plus economical / fastest / best-quality picks with their trade-offs; switch Balanced, Quality, Cost or Latency at any time",
+      "<b>Result cards</b>: confidence, the label mix, per-check bars, and whether the model passed the quality gate",
+      "<b>Side-by-side</b>: confidence, hard breaks, cost per 1K requests, latency per token — latency is indicative only (measured from your machine, not production)",
       "<b>Dimension breakdown</b>: which model wins on which check",
       "<b>Evaluations</b>: original vs candidate, with the differences highlighted"],
     decide: "Which candidate — and what's holding it back?", go: "Run details → Results",
@@ -171,6 +180,45 @@ async function renderGuide(main) {
     h("div", { class: "row", style: "gap:10px" }, playBtn,
       h("button", { class: "btn secondary", onclick: () => go("new") }, "Start a new run"),
       latest ? h("button", { class: "btn ghost", onclick: () => go("run", latest.run_id) }, "Open my latest run") : null)));
+
+  // ---- what it solves for (quick visual before the flow)
+  root.append(h("section", { class: "card g-solve" },
+    h("div", { class: "g-solve-head" },
+      h("h3", { style: "margin:0" }, "What ModelShift solves for"),
+      h("span", { class: "muted", style: "font-size:12px" }, "The risk isn't a worse model — it's a different one")),
+    h("div", { class: "g-solve-grid" },
+      // problem panel
+      h("div", { class: "g-solve-card problem" },
+        h("div", { class: "g-solve-tag bad" }, "Migrate and hope"),
+        h("p", { class: "g-solve-lead" }, "You swap in a newer model. It may even be smarter — but it quietly answers "
+          + "differently, and something downstream breaks."),
+        h("div", { class: "g-solve-chips" },
+          h("span", { class: "g-xchip" }, "Format changed"),
+          h("span", { class: "g-xchip" }, "A fact drifted"),
+          h("span", { class: "g-xchip" }, "Tool call mismatched"),
+          h("span", { class: "g-xchip" }, "More verbose")),
+        h("div", { class: "g-solve-foot bad" }, "✕ You find out in production")),
+      // arrow
+      h("div", { class: "g-solve-arrow", "aria-hidden": "true" }, "→"),
+      // solution panel
+      h("div", { class: "g-solve-card solution" },
+        h("div", { class: "g-solve-tag ok" }, "Migrate with evidence"),
+        h("p", { class: "g-solve-lead" }, "ModelShift replays your real requests against the candidate and scores "
+          + "how compatible each answer is with what your current model said — before you switch."),
+        // mini flow strip
+        h("div", { class: "g-flowstrip" },
+          h("span", { class: "g-fstep" }, "Your traffic"),
+          h("span", { class: "g-farr" }, "→"),
+          h("span", { class: "g-fstep" }, "Replay on Bedrock"),
+          h("span", { class: "g-farr" }, "→"),
+          h("span", { class: "g-fstep" }, "Score every answer"),
+          h("span", { class: "g-farr" }, "→"),
+          h("span", { class: "g-fstep accent" }, "Confidence verdict")),
+        h("div", { class: "g-solve-verdicts" },
+          h("span", { class: "band safe_drop_in", style: "margin:0" }, "Safe drop-in"),
+          h("span", { class: "band drop_in_with_prompt_tuning", style: "margin:0" }, "Prompt tuning"),
+          h("span", { class: "band not_a_drop_in", style: "margin:0" }, "Not yet")),
+        h("div", { class: "g-solve-foot ok" }, "✓ You know before you switch")))));
 
   // ---- pipeline
   const track = h("div", { class: "g-track", role: "tablist", "aria-label": "Steps of a run" });

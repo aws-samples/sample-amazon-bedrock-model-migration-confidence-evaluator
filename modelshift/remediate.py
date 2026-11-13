@@ -58,7 +58,8 @@ def regression_guard_ids(pair_scores: List[PairScore], model: str, exclude_ids: 
     return sorted(random.Random(seed).sample(pool, n))
 
 
-_EFFORT_ORDER = [ReasoningEffort.MINIMAL, ReasoningEffort.LOW, ReasoningEffort.MEDIUM, ReasoningEffort.HIGH]
+_EFFORT_ORDER = [ReasoningEffort.NONE, ReasoningEffort.MINIMAL, ReasoningEffort.LOW, ReasoningEffort.MEDIUM,
+                 ReasoningEffort.HIGH, ReasoningEffort.XHIGH]
 
 # Per-reason instruction templates. Written as instructions to the model, in the
 # imperative, so they can be pasted into a production system prompt unchanged.
@@ -92,10 +93,18 @@ _DEFAULT_TEMPLATE = (
 )
 
 
-def lower_effort(effort: ReasoningEffort) -> Optional[ReasoningEffort]:
-    """One step lower, or None if already at the lowest setting."""
+def lower_effort(effort: ReasoningEffort,
+                 allowed: Optional[List[str]] = None) -> Optional[ReasoningEffort]:
+    """One step lower among the efforts the model accepts, or None if already at the lowest.
+    `allowed` = the model's supported efforts (None = any). Never steps down to 'none': that
+    switches reasoning off entirely -- a different mode, so it's only ever chosen by hand."""
     i = _EFFORT_ORDER.index(effort)
-    return _EFFORT_ORDER[i - 1] if i > 0 else None
+    for e in reversed(_EFFORT_ORDER[:i]):
+        if e == ReasoningEffort.NONE:
+            continue
+        if allowed is None or e.value in allowed:
+            return e
+    return None
 
 
 def _golden_json_keys(samples: List[NormalizedSample]) -> Optional[List[str]]:
@@ -141,7 +150,10 @@ def concretize(rem: Remediation,
         return rem
     target = [s for s in samples if s.id in set(rem.target.sample_ids)]
     if ch.type == "reasoning_effort":
-        lower = lower_effort(current_effort)
+        from .config import MODEL_CATALOG, base_model
+        entry = MODEL_CATALOG.get(base_model(rem.candidate))
+        allowed = entry.reasoning_efforts if entry and entry.effort_applies else None
+        lower = None if (entry and not entry.effort_applies) else lower_effort(current_effort, allowed)
         if lower is not None:
             ch.before, ch.after, ch.placement = current_effort.value, lower.value, None
             rem.expected_effect = (f"Lower reasoning effort {current_effort.value} -> {lower.value} "
@@ -155,14 +167,19 @@ def concretize(rem: Remediation,
     return rem
 
 
-def validate_change(ch: RemediationChange) -> RemediationChange:
-    """Reject changes that can't be applied. Raises ValueError with a user-facing message."""
+def validate_change(ch: RemediationChange, model: Optional[str] = None) -> RemediationChange:
+    """Reject changes that can't be applied. Raises ValueError with a user-facing message.
+    With `model`, a reasoning-effort change must be one that model accepts."""
     if ch.type not in CHANGE_TYPES:
         raise ValueError(f"change type must be one of {', '.join(CHANGE_TYPES)}")
     if ch.type == "reasoning_effort":
         valid = [e.value for e in ReasoningEffort]
+        if model:
+            from .config import supported_efforts
+            valid = supported_efforts(model) or valid
         if ch.after not in valid:
-            raise ValueError(f"reasoning effort must be one of {', '.join(valid)}")
+            raise ValueError(f"reasoning effort must be one of {', '.join(valid)}"
+                             + (f" for {model}" if model else ""))
         ch.placement = None
         return ch
     text = (ch.after or "").strip()

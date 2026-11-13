@@ -65,6 +65,8 @@ DIMENSIONS = [
     ("d5_instruction", "D5", "Instruction-following",
      "Honors the system/instructions the original also followed.", False),
     ("d6_tool_call", "D6", "Tool-call match", "Same function name + argument schema (tool-call responses only).", True),
+    ("d7_consistency", "D7", "Consistency",
+     "How alike the answers are when the same request is replayed (replays only). Never changes a label.", False),
 ]
 DIM_BY_KEY = {d[0]: d for d in DIMENSIONS}
 JUDGE_REASON_TEXT = {
@@ -200,6 +202,30 @@ class Ctx:
 # --------------------------------------------------------------------------
 # Flowables: rounded card, progress bar, distribution bar, pill/band, swatch
 # --------------------------------------------------------------------------
+class _Clip(Flowable):
+    """Shows only the top `max_h` points of a flowable (clipped). Used for content that is taller
+    than a page and cannot be split, so the PDF still renders instead of failing."""
+
+    def __init__(self, child: Flowable, max_h: float):
+        super().__init__()
+        self.child, self.max_h = child, max_h
+        self._ch = 0.0
+
+    def wrap(self, aw, ah):
+        w, self._ch = self.child.wrap(aw, 10 ** 6)
+        self.width, self.height = w, min(self._ch, self.max_h)
+        return self.width, self.height
+
+    def draw(self):
+        c = self.canv
+        c.saveState()
+        p = c.beginPath()
+        p.rect(0, 0, self.width, self.height)
+        c.clipPath(p, stroke=0, fill=0)
+        self.child.drawOn(c, 0, self.height - self._ch)  # align the child's top with ours
+        c.restoreState()
+
+
 class Box(Flowable):
     """Rounded container (the UI .card / .diff-pane / .banner). Splits across
     pages only when it is taller than a full page; otherwise it moves whole."""
@@ -235,11 +261,53 @@ class Box(Flowable):
         self.width, self.height = aw, max(h, self.min_h)
         return self.width, self.height
 
+    @staticmethod
+    def _splits_to_fit(c: Flowable, iw: float, max_h: float) -> bool:
+        """True if repeatedly splitting `c` at max_h yields parts that each fit. A table whose
+        single content row is taller than a page splits off only its header, leaving an
+        unsplittable remainder -- that must count as NOT splittable."""
+        cur = c
+        for _ in range(50):
+            if cur.wrap(iw, 10 ** 6)[1] <= max_h:
+                return True
+            parts = cur.split(iw, max_h) or []
+            if len(parts) < 2 or parts[0].wrap(iw, 10 ** 6)[1] > max_h:
+                return False
+            cur = parts[-1] if len(parts) == 2 else parts[1]
+        return False
+
+    def _fit_oversized(self, iw: float) -> bool:
+        """Replace any child that is taller than a full page AND cannot be split into page-sized
+        parts (e.g. a side-by-side Table of two long answers) with a page-height truncated copy
+        plus a note. Without this, reportlab raises LayoutError and the whole PDF fails.
+        Returns True if anything changed."""
+        max_h = FRAME_H - self.pad[0] - self.pad[2] - 24
+        changed = False
+        out: List[Flowable] = []
+        for c in self.children:
+            _, ch = c.wrap(iw, 10 ** 6)
+            if ch > max_h and not self._splits_to_fit(c, iw, max_h):
+                out.append(_Clip(c, max_h))
+                out.append(Paragraph("<i>(truncated to fit the page — the full text is in the app's "
+                                     "Evaluations view)</i>",
+                                     ParagraphStyle("trunc_note", fontName="Helvetica", fontSize=6.8,
+                                                    leading=9, textColor=HexColor("#8b95a3"))))
+                changed = True
+            else:
+                out.append(c)
+        if changed:
+            self.children = out
+        return changed
+
     def split(self, aw, ah):
         full_h = self.wrap(aw, ah)[1]
         if full_h <= FRAME_H and ah < FRAME_H - 1:
             return []  # fits on a fresh page: move it whole (KeepTogether behaviour)
         iw = self._inner_w(aw)
+        if self._fit_oversized(iw):
+            full_h = self.wrap(aw, ah)[1]
+            if full_h <= FRAME_H and ah < FRAME_H - 1:
+                return []
         avail = ah - self.pad[0] - self.pad[2]
         if avail < 40:
             return []
@@ -586,6 +654,188 @@ def _hero(ctx: Ctx, report: Dict[str, Any]) -> Optional[Box]:
     return card(ctx, [body], accent_left=bc, pad=(14, 14, 14, 17))
 
 
+# --------------------------------------------------------------------------
+# Multi-objective recommendation (spec R7.4; mirrors the app's Option A panel)
+# --------------------------------------------------------------------------
+PROFILE_TEXT = {"best_overall": "BEST OVERALL", "best_quality": "BEST QUALITY",
+                "most_economical": "MOST ECONOMICAL", "lowest_latency": "LOWEST LATENCY\u00a0\u2020"}
+PROFILE_CHIP = {"best_overall": "Best overall", "best_quality": "Best quality",
+                "most_economical": "Most economical", "lowest_latency": "Lowest latency"}
+PRESET_TEXT = {"balanced": "Balanced", "quality_first": "Quality-first", "cost_first": "Cost-first",
+               "latency_first": "Latency-first", "custom": "Custom"}
+DAGGER = "\u2020"
+
+
+def cost1k(c: Dict[str, Any]) -> str:
+    """Cost per 1K requests; an unknown price is never shown as $0."""
+    if c.get("cost_known") is False:
+        return "Price not configured"
+    v = c.get("cost_per_1k_requests")
+    return "—" if v is None else f"${v:,.2f}"
+
+
+def ms_tok(c: Dict[str, Any]) -> str:
+    v = c.get("ms_per_output_token_p50")
+    if v is None:
+        return "—"
+    return f"{v:.1f}" + (" (few calls)" if c.get("latency_low_confidence") else "")
+
+
+def signed_pct(v) -> str:
+    return "—" if v is None else f"{'+' if v > 0 else ''}{v:.0f}%"
+
+
+def _picks_for(rec: Optional[Dict[str, Any]], model: str) -> List[str]:
+    if not rec or rec.get("none_eligible"):
+        return []
+    return [p["kind"] for p in rec.get("profiles") or [] if p.get("model") == model]
+
+
+def _weights_line(rec: Dict[str, Any]) -> str:
+    w = rec.get("weights") or {}
+    name = PRESET_TEXT.get(w.get("preset"), w.get("preset") or "Balanced")
+    return (f"Ranked with: <b>{esc(name)}</b> — quality {pct((w.get('quality') or 0) * 100)}, "
+            f"cost {pct((w.get('cost') or 0) * 100)}, latency {pct((w.get('latency') or 0) * 100)}. "
+            f"Only candidates that pass the quality gate can be recommended; the economical, latency and "
+            f"overall picks must be within {rec.get('quality_tolerance', 10):.0f} confidence points of "
+            f"the best quality.")
+
+
+def _recommendation_hero(ctx: Ctx, report: Dict[str, Any]) -> Optional[List[Any]]:
+    """Best overall card + three alternative-profile cards + weights/best-fit lines."""
+    rec = report.get("recommendation")
+    if not rec:
+        return None
+    t = ctx.t
+    cands = {c["model"]: c for c in report.get("candidates") or []}
+    best_fit = report.get("best") or {}
+    fit_line = ctx.P(f"Best fit (Migration Confidence alone): <b>{esc(best_fit.get('model', '—'))}</b> · "
+                     f"{pct(best_fit.get('migration_confidence'))}", "muted")
+    if rec.get("none_eligible"):
+        closest = rec.get("closest_by_fit")
+        txt = ("<b>No candidate is ready to recommend.</b> Every candidate failed the quality gate."
+               + (f" Closest by fit: <b>{esc(closest)}</b> — see its suggested remediations." if closest else ""))
+        none_lines = (rec.get("explanations") or {}).get("none") or []
+        if none_lines:
+            txt = ("<b>No candidate is ready to recommend.</b> " + esc(" ".join(none_lines))
+                   + " See its suggested remediations.")
+        return [banner(ctx, txt, "warn"), fit_line, Spacer(1, 8)]
+
+    profiles = {p["kind"]: p for p in rec.get("profiles") or []}
+    axes = {a["model"]: a for a in rec.get("axes") or []}
+    bo = profiles.get("best_overall") or {}
+    v = cands.get(bo.get("model"), {})
+    ax = axes.get(bo.get("model"), {})
+    band = v.get("verdict_band", "")
+    bc = ctx.band_color(band)
+
+    row_w = CW - 24           # inside the outer card's 12pt side padding
+    hero_w = row_w * 0.40
+    iw = hero_w - 24
+
+    def axrow(label, frac, color, value):
+        return [ctx.P(label, "small"), Bar((frac or 0) / 100.0, color, t["surface2"], height=4.5),
+                ctx.P(esc(value), "small_r")]
+
+    rows = [axrow("Quality", ax.get("quality_score"), t["ok"], f"{(v.get('migration_confidence') or 0):.1f}"),
+            axrow("Cost", ax.get("cost"), t["accent"], "not included" if ax.get("cost") is None else cost1k(v)),
+            axrow("Latency" + DAGGER, ax.get("latency"), t["drift"],
+                  "not included" if ax.get("latency") is None else ms_tok(v))]
+    axt = Table(rows, colWidths=[iw * 0.24, iw * 0.46, iw * 0.30])
+    axt.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "MIDDLE"), ("ALIGN", (2, 0), (2, -1), "RIGHT"),
+                             ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                             ("RIGHTPADDING", (0, 0), (0, -1), 4), ("RIGHTPADDING", (1, 0), (1, -1), 6),
+                             ("TOPPADDING", (0, 0), (-1, -1), 2), ("BOTTOMPADDING", (0, 0), (-1, -1), 2)]))
+    score = ax.get("composite")
+    head = [Pill(ctx, BAND_TEXT.get(band, band), bc, kind="band", size=6.8)] if band else []
+    hero = Box([
+        ctx.P(PROFILE_TEXT["best_overall"], "small"),
+        Spacer(1, 3),
+        ctx.P(esc(bo.get("model") or "—"), "hero"),
+        Spacer(1, 3),
+        *head,
+        ctx.P(f"overall score {score:.0f}/100" if score is not None else "", "muted"),
+        Spacer(1, 5),
+        axt,
+        Spacer(1, 5),
+        ctx.P("Quality = how closely answers match the current model (Migration Confidence) · Cost = list "
+              "price per 1,000 requests · Latency = ms per output token, lower is faster", "small"),
+    ], fill=mix(t["accent"], t["surface"], 0.08), stroke=t["accent"], radius=8, pad=(11, 12, 11, 12))
+
+    alt_w = (row_w - hero_w - 10 - 2 * 8) / 3
+
+    ex = rec.get("explanations") or {}
+
+    def alt(kind):
+        p = profiles.get(kind) or {}
+        lines = ex.get(kind) or [] if p.get("model") else []
+        body = " ".join(lines) if lines else (
+            (p.get("tradeoff") or p.get("reason") or "") if p.get("model") else (p.get("reason") or ""))
+        return Box([ctx.P(PROFILE_TEXT[kind], "small"), Spacer(1, 3),
+                    ctx.P(esc(p.get("model") or "No candidate qualifies"), "tdm"), Spacer(1, 4),
+                    ctx.P(esc(body), "dim" if p.get("model") else "muted")],
+                   fill=t["surface2"], stroke=t["border"], radius=7, pad=(10, 10, 10, 10))
+
+    alts = [alt("best_quality"), alt("most_economical"), alt("lowest_latency")]
+    tallest = max([b.wrap(alt_w, FRAME_H)[1] for b in alts] + [hero.wrap(hero_w, FRAME_H)[1]])
+    for b in alts + [hero]:
+        b.min_h = tallest
+    row = hrow([hero, "", alts[0], "", alts[1], "", alts[2]],
+               [hero_w, 10, alt_w, 8, alt_w, 8, alt_w])
+
+    inner_w = row_w
+    title = hrow([ctx.P("Recommendation", "h3"),
+                  ctx.P("All things considered: quality, cost and latency", "muted_r")],
+                 [inner_w * 0.4, inner_w * 0.6], valign="MIDDLE", aligns=["LEFT", "RIGHT"])
+    kids: List[Any] = [title, Spacer(1, 8), row]
+    why = ex.get("best_overall") or []
+    if why:
+        kids += [Spacer(1, 7), Box([ctx.P("Why this pick", "small"), Spacer(1, 2),
+                                    *[ctx.P(esc(line), "dim") for line in why]],
+                                   fill=t["surface2"], stroke=t["border"], radius=6, pad=(8, 10, 8, 10))]
+    kids += [Spacer(1, 7), ctx.P(_weights_line(rec), "muted")]
+    for n in rec.get("notes") or []:
+        kids += [Spacer(1, 2), ctx.P(esc(n), "muted")]
+    inel = rec.get("ineligible") or {}
+    if inel:
+        txt = " · ".join(f"<font name='Courier'>{esc(m)}</font> ({esc(', '.join(r) or 'not eligible')})"
+                         for m, r in inel.items())
+        kids += [Spacer(1, 3), ctx.P("Not recommended (failed the quality gate): " + txt, "muted")]
+    kids += [Spacer(1, 3), fit_line]
+    return [card(ctx, kids, pad=(12, 12, 12, 12)),
+            banner(ctx, f"<b>{DAGGER}</b> " + esc(rec.get("latency_disclaimer") or ""),
+                   "info")]
+
+
+def _eligibility_table(ctx: Ctx, report: Dict[str, Any]) -> Optional[Box]:
+    """Per-candidate quality gate: why each candidate can or cannot be recommended."""
+    rec = report.get("recommendation")
+    cands = report.get("candidates") or []
+    if not rec or not cands:
+        return None
+    t = ctx.t
+    iw = CW - 24
+    widths = [130, 62, 56, 52, 70]
+    widths.append(iw - sum(widths))
+    rows = []
+    for c in cands:
+        ok = c.get("eligible")
+        col = t["ok"] if ok else t["partial"]
+        reasons = ", ".join(c.get("ineligible_reasons") or [])
+        picks = ", ".join(PROFILE_CHIP[k] for k in _picks_for(rec, c["model"])) or "—"
+        rows.append([
+            ctx.P(esc(c["model"]), "tdm"),
+            ctx.P(pct(c.get("migration_confidence")), "td"),
+            ctx.P(pct((c.get("hard_break_rate") or 0) * 100), "td"),
+            ctx.P(pct((c.get("error_rate") or 0) * 100), "td"),
+            ctx.P(f'<font color="{hexs(col)}"><b>{"Passed" if ok else "Failed"}</b></font>', "td"),
+            ctx.P(esc(reasons) if not ok else esc(picks), "td"),
+        ])
+    tbl = ui_table(ctx, ["Candidate", "Confidence", "Hard break", "Errors", "Quality gate",
+                         "Why not / picks held"], rows, widths)
+    return card(ctx, [tbl], pad=(6, 12, 6, 12))
+
+
 def _golden(ctx: Ctx, src: Dict[str, Any]) -> Box:
     t = ctx.t
     iw = CW - 27 - 2
@@ -650,8 +900,9 @@ def _cand_card(ctx: Ctx, c: Dict[str, Any], width: float) -> Box:
                                      ("RIGHTPADDING", (0, 0), (0, -1), 4),
                                      ("TOPPADDING", (0, 0), (-1, -1), 1.6), ("BOTTOMPADDING", (0, 0), (-1, -1), 1.6)]))
     counts = " · ".join(f"{dist.get(k, 0)} {LABEL_TEXT[k]}" for k in LABELS)
-    meta = (f"hard-break {pct((c.get('hard_break_rate') or 0) * 100)} · {money(c.get('cost_total'))} · "
-            f"{ms(c.get('latency_avg_ms'))} avg")
+    cost_txt = "price not configured" if c.get("cost_known") is False else money(c.get("cost_total"))
+    meta = (f"hard-break {pct((c.get('hard_break_rate') or 0) * 100)} · {cost_txt} · "
+            f"{ms(c.get('latency_avg_ms'))} avg{DAGGER}")
     kids: List[Any] = head + [
         ctx.P("via " + esc(ENDPOINT_TEXT.get(ep, ep)), "monosm") if ep else None,
         Spacer(1, 8),
@@ -672,27 +923,37 @@ def _cand_card(ctx: Ctx, c: Dict[str, Any], width: float) -> Box:
     return card(ctx, kids, accent_top=bc, pad=(13, 12, 12, 12), space_after=0)
 
 
-def _side_by_side(ctx: Ctx, cands: List[Dict[str, Any]]) -> Box:
+def _side_by_side(ctx: Ctx, cands: List[Dict[str, Any]],
+                  rec: Optional[Dict[str, Any]] = None) -> Box:
     iw = CW - 24
-    widths = [78, 66, 52, 48, 42, 46, 46]  # leaves ~100pt for the verdict band
+    axes = {a["model"]: a for a in ((rec or {}).get("axes") or [])}
+    widths = [92, 42, 36, 54, 42, 44, 46, 34]  # verdict band gets the rest
     widths.append(iw - sum(widths))
     rows = []
     for c in cands:
         band = c.get("verdict_band", "")
+        a = axes.get(c["model"]) or {}
         rows.append([
             ctx.P(esc(c["model"]), "tdm"),
-            ctx.P(esc(ENDPOINT_TEXT.get(c.get("endpoint"), c.get("endpoint") or "—")), "td"),
             ctx.P(f'<font color="{hexs(ctx.score_color((c.get("migration_confidence") or 0) / 100))}"><b>'
                   f'{pct(c.get("migration_confidence"))}</b></font>', "td"),
             ctx.P(pct((c.get("hard_break_rate") or 0) * 100), "td"),
-            ctx.P(money(c.get("cost_total")), "td"),
+            ctx.P(esc(cost1k(c)), "td"),
+            ctx.P(signed_pct(c.get("cost_vs_current_pct")), "td"),
+            ctx.P(esc(ms_tok(c)), "td"),
             ctx.P(ms(c.get("latency_avg_ms")), "td"),
-            ctx.P(ms(c.get("latency_p95_ms")), "td"),
-            Pill(ctx, BAND_TEXT.get(band, band), ctx.band_color(band), kind="band", size=6.6),
+            ctx.P("—" if a.get("composite") is None else f"{a['composite']:.0f}", "td"),
+            Pill(ctx, BAND_TEXT.get(band, band), ctx.band_color(band), kind="band", size=6.4),
         ])
-    tbl = ui_table(ctx, ["Candidate", "Endpoint", "Confidence", "Hard break", "Cost",
-                         "Latency avg", "Latency p95", "Verdict"], rows, widths)
-    return card(ctx, [tbl], pad=(6, 12, 6, 12))
+    tbl = ui_table(ctx, ["Candidate", "Conf.", "Hard break", "Cost / 1K req", "Cost vs current",
+                         f"ms / token{DAGGER}", f"Latency avg{DAGGER}", "Score", "Verdict"],
+                   rows, widths)
+    note = ctx.P("Cost is list price at current public Bedrock rates (Standard tier, short context), assuming no "
+                 "prompt caching; cost vs current compares the same requests against today's model when its price "
+                 "is known. Conf. = Migration Confidence. "
+                 "Score = the weighted recommendation score (eligible candidates only). "
+                 f"{DAGGER} Latency is indicative only.", "small")
+    return card(ctx, [tbl, Spacer(1, 5), note], pad=(6, 12, 8, 12))
 
 
 def _dimension_matrix(ctx: Ctx, cands: List[Dict[str, Any]]) -> Optional[Box]:
@@ -720,6 +981,42 @@ def _dimension_matrix(ctx: Ctx, cands: List[Dict[str, Any]]) -> Optional[Box]:
     tbl = ui_table(ctx, ["Dimension"] + [one_line(c["model"], 28) for c in cands], rows,
                    [first] + [colw] * len(cands))
     return card(ctx, [tbl], pad=(6, 12, 6, 12))
+
+
+def _consistency_section(ctx: Ctx, report: Dict[str, Any], cands: List[Dict[str, Any]]) -> Optional[Box]:
+    """Replays only: per-candidate D7 table, least consistent requests, and a method note."""
+    measured = [c for c in cands if isinstance(c.get("consistency"), (int, float))]
+    if (report.get("replays") or 1) < 2 or not measured:
+        return None
+    iw = CW - 24
+    widths = [150, 60, 80, 70, 80]
+    widths.append(iw - sum(widths))
+    rows = []
+    for c in measured:
+        d7 = c["consistency"]
+        lc = c.get("least_consistent") or []
+        worst = ", ".join(f"{esc(one_line(x['sample_id'], 18))} ({x['d7']:.2f})" for x in lc[:3]) or "—"
+        rows.append([
+            ctx.P(esc(c["model"]) + (' <font size="6.4">UNSTABLE</font>' if c.get("unstable") else ""), "tdm"),
+            ctx.P(f'<font color="{hexs(ctx.score_color(d7))}"><b>{d7:.2f}</b></font>'
+                  + (" *" if c.get("consistency_low_confidence") else ""), "td"),
+            ctx.P(f"{c.get('unstable_requests', 0)} of {c.get('consistency_measured', 0)}", "td"),
+            ctx.P(pct((c.get("flip_rate") or 0) * 100), "td"),
+            ctx.P("—" if c.get("latency_spread_p50") is None else f"{c['latency_spread_p50']:.1f}×", "td"),
+            ctx.P(worst, "small"),
+        ])
+    tbl = ui_table(ctx, ["Candidate", "D7", "Unstable requests", "Flip rate", f"Latency spread{DAGGER}",
+                         "Least consistent requests (D7)"], rows, widths)
+    note = ctx.P(
+        "Every replayed answer is scored against your current model like a normal call and counts toward "
+        "Migration Confidence. D7 Consistency (0–1) is a separate dimension: half how alike the answers to the "
+        "same request are (same text-overlap measure as D1; a pair counts as 0 if format, key facts or tool "
+        "calls differ), half how often they got the same label. It never changes a label or Migration "
+        "Confidence. Unstable = D7 below the threshold, or answers that are both Compatible and Incompatible. "
+        "Flip rate = share of requests where some answers hard-break and some don't. Variance reflects each "
+        "model's default sampling settings. "
+        "Latency spread = median slowest/fastest answer per request. * = few requests measured.", "small")
+    return card(ctx, [tbl, Spacer(1, 5), note], pad=(6, 12, 8, 12))
 
 
 def _failure_reasons(ctx: Ctx, cands: List[Dict[str, Any]]) -> Optional[Box]:
@@ -832,7 +1129,8 @@ def _eval_index(ctx: Ctx, rows: List[Dict[str, Any]]) -> Box:
     data = []
     for r in rows:
         dmap = {d.get("key"): d.get("score") for d in r.get("dimensions") or []}
-        cells: List[Any] = [ctx.P(esc(r.get("sample_id")), "tdm"),
+        rep = f" · r{(r.get('replay_index') or 0) + 1}" if (r.get("replays") or 1) > 1 else ""
+        cells: List[Any] = [ctx.P(esc(r.get("sample_id")) + rep, "tdm"),
                             Pill(ctx, LABEL_TEXT.get(r.get("label"), r.get("label") or "—"),
                                  ctx.label_color(r.get("label")), label_key=r.get("label") or "", size=6.4)]
         for key in ("d1_semantic", "d2_format", "d3_factual", "d4_verbosity", "d5_instruction"):
@@ -868,7 +1166,10 @@ def _eval_card(ctx: Ctx, idx: int, row: Dict[str, Any], model: str) -> Box:
     iw = CW - 28
     label = row.get("label") or "—"
     lc = ctx.label_color(label)
-    head = card_head(ctx, iw, f"#{idx} · Sample {row.get('sample_id', '')}",
+    rep_txt = (f" · replay {(row.get('replay_index') or 0) + 1} of {row.get('replays')}"
+               + (f" · D7 {row['consistency']:.2f}" if isinstance(row.get("consistency"), (int, float)) else "")
+               if (row.get("replays") or 1) > 1 else "")
+    head = card_head(ctx, iw, f"#{idx} · Sample {row.get('sample_id', '')}{rep_txt}",
                      Pill(ctx, LABEL_TEXT.get(label, label), lc, label_key=label, size=7))
 
     msgs = row.get("messages") or []
@@ -992,18 +1293,37 @@ def render_pdf(report: Dict[str, Any], theme: str = "dark") -> bytes:
                   onLaterPages=_page_decor(ctx, report, gen_ts, build))
         return buf.getvalue()
 
-    hero = _hero(ctx, report)
-    if hero is not None:
-        story.append(hero)
+    rec = report.get("recommendation")
+    rec_block = _recommendation_hero(ctx, report)
+    if rec_block:
+        story += rec_block
+    else:
+        hero = _hero(ctx, report)  # runs without a recommendation keep the original hero
+        if hero is not None:
+            story.append(hero)
+    disclaimer = (rec or {}).get("latency_disclaimer") or report.get("latency_disclaimer")
     for cv in report.get("caveats") or []:
+        if rec_block and cv == disclaimer:
+            continue  # already shown in full under the recommendation
         story.append(banner(ctx, esc(cv), "warn"))
     errored = sum(c.get("errored") or 0 for c in cands)
     if errored:
         story.append(banner(ctx, f"{errored} candidate call(s) errored and were excluded from scoring.", "warn"))
     story.append(_golden(ctx, report.get("source") or {}))
+    if report.get("exec_summary"):
+        story.append(Spacer(1, 4))
+        story.append(ctx.P("<b>Execution:</b> " + esc(report["exec_summary"])
+                           + (". Latency was measured with parallel calls, which can add some delay per call."
+                              if (report.get("parallelism") or 1) > 1 else "."), "muted"))
 
-    story += section_title(ctx, "Side-by-side", "Ranked best-first.")
-    story.append(_side_by_side(ctx, cands))
+    el = _eligibility_table(ctx, report)
+    if el is not None:
+        story += section_title(ctx, "Quality gate",
+                               "Which candidates can be recommended, and why the others cannot.")
+        story.append(el)
+
+    story += section_title(ctx, "Side-by-side", "Ranked by fit (Migration Confidence), best first.")
+    story.append(_side_by_side(ctx, cands, rec))
 
     cols = min(len(cands), 3)
     g = grid([_cand_card(ctx, c, (CW - 10 * (cols - 1)) / cols) for c in cands], CW, cols)
@@ -1018,6 +1338,12 @@ def render_pdf(report: Dict[str, Any], theme: str = "dark") -> bytes:
         story += section_title(ctx, "Dimension breakdown",
                                "Average score per compatibility dimension, per candidate.")
         story.append(dm)
+
+    cs = _consistency_section(ctx, report, cands)
+    if cs is not None:
+        story += section_title(ctx, "Consistency across replays",
+                               f"Each request was sent {report.get('replays', 1)} times per candidate.")
+        story.append(cs)
 
     fr = _failure_reasons(ctx, cands)
     if fr is not None:
