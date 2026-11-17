@@ -189,3 +189,155 @@ def test_reconciliation_across_all_fixtures():
     assert res.report.reconciles()
     # detected models surfaced
     assert any(dm.rows > 0 for dm in res.report.detected_models)
+
+
+# ------------------------- Prompt capture (flat) --------------------------- #
+import json  # noqa: E402
+
+
+def _capture(**overrides):
+    row = json.loads(_bytes("prompt_capture_single.json"))
+    row.update(overrides)
+    return row
+
+
+def test_detect_single_pretty_printed_object():
+    # One pretty-printed object must be ONE row, not 15 line-split parse errors.
+    assert detect_container(_bytes("prompt_capture_single.json").decode()) == Container.SINGLE_OBJECT
+
+
+def test_prompt_capture_single_file_ingests_one_evaluable_sample():
+    res = ingest([(_bytes("prompt_capture_single.json"), "cap1")])
+    assert res.report.found == 1
+    assert res.report.evaluable == 1
+    assert res.report.reconciles()
+    s = res.samples[0]
+    assert s.id == "CAP-0001"
+    assert s.source.shape == Shape.PROMPT_CAPTURE
+    assert s.legacy_model == "gpt41-deployment:analyze"
+    assert s.request.instructions == "You are a helpful AI assistant."
+    assert [m.role for m in s.request.input_messages] == ["user"]
+    assert s.request.input_messages[0].content.startswith("Compare the two extractions")
+    assert s.golden.kind == GoldenKind.JSON  # response string is a JSON list
+    assert s.usage.prompt_tokens == 120 and s.usage.completion_tokens == 30
+    assert s.usage.total_tokens == 150
+
+
+def test_prompt_capture_in_jsonl_and_array_containers():
+    rows = [_capture(request_id="c1"), _capture(request_id="c2", response="plain text answer")]
+    jsonl = "\n".join(json.dumps(r) for r in rows).encode()
+    arr = json.dumps(rows).encode()
+    for blob in (jsonl, arr):
+        res = ingest([(blob, "multi")])
+        assert res.report.evaluable == 2
+        assert {s.golden.kind for s in res.samples} == {GoldenKind.JSON, GoldenKind.TEXT}
+
+
+def test_prompt_capture_with_list_field_is_not_treated_as_wrapper():
+    blob = json.dumps(_capture(tags=["a", "b"]), indent=2)
+    assert detect_container(blob) == Container.SINGLE_OBJECT
+    assert ingest([(blob.encode(), "x")]).report.evaluable == 1
+
+
+def test_prompt_capture_non_2xx_dropped():
+    s, drop, shape = normalize_row(RawRow(data=_capture(status_code=429, response="rate limited"),
+                                          object_uri="x", row_index=0))
+    assert shape == Shape.PROMPT_CAPTURE
+    assert s is None and drop.eval_block_reason == DropReason.EMPTY_RESPONSE
+
+
+def test_prompt_capture_empty_prompt_dropped():
+    _, drop, _ = normalize_row(RawRow(data=_capture(user_prompt="   "), object_uri="x", row_index=0))
+    assert drop.eval_block_reason == DropReason.NO_PROMPT
+
+
+def test_prompt_capture_redacted_dropped():
+    _, drop, _ = normalize_row(RawRow(data=_capture(response="[REDACTED]"), object_uri="x", row_index=0))
+    assert drop.eval_block_reason == DropReason.REDACTED
+
+
+# ------------------- Conversation array (Semantic Kernel) ------------------- #
+def _sk(role, text):
+    return {"Content": text, "Role": {"Label": role}}
+
+
+def _conv_bytes(msgs):
+    return json.dumps(msgs, indent=2).encode()
+
+
+def test_conversation_array_is_one_row_not_one_per_message():
+    msgs = [_sk("user", "Classify this appeal: code 99213, remark CO-50."),
+            _sk("assistant", '{"decision": "Uphold"}')]
+    res = ingest([(_conv_bytes(msgs), "upload:z!case_1.json")])
+    assert res.report.found == 1 and res.report.evaluable == 1
+    assert res.report.reconciles()
+    s = res.samples[0]
+    assert s.source.shape == Shape.CONVERSATION
+    assert s.id == "upload:z!case_1.json#0"  # no request_id in the format -> file-based id
+    assert [m.role for m in s.request.input_messages] == ["user"]
+    assert s.request.instructions is None
+    assert s.golden.kind == GoldenKind.JSON and s.golden.text == '{"decision": "Uphold"}'
+
+
+def test_conversation_leading_assistant_becomes_instructions():
+    msgs = [_sk("assistant", "You are an expert appeals processor."),
+            _sk("user", "Process this appeal."),
+            _sk("assistant", "Decision: Overturn")]
+    s = ingest([(_conv_bytes(msgs), "u")]).samples[0]
+    assert s.request.instructions == "You are an expert appeals processor."
+    assert [m.role for m in s.request.input_messages] == ["user"]
+    assert s.golden.kind == GoldenKind.TEXT and s.golden.text == "Decision: Overturn"
+
+
+def test_conversation_multiturn_and_system_role_and_string_roles():
+    msgs = [{"role": "system", "content": "Be terse."},
+            {"role": "user", "content": "Q1"}, {"role": "assistant", "content": "A1"},
+            {"role": "user", "content": "Q2"}, {"role": "assistant", "content": "A2"}]
+    s = ingest([(_conv_bytes(msgs), "u")]).samples[0]
+    assert s.request.instructions == "Be terse."
+    assert [(m.role, m.content) for m in s.request.input_messages] == [
+        ("user", "Q1"), ("assistant", "A1"), ("user", "Q2")]
+    assert s.golden.text == "A2"
+
+
+def test_conversation_semantic_kernel_items_text():
+    msgs = [{"Role": {"Label": "user"}, "Items": [{"$type": "TextContent", "Text": "hello"}]},
+            {"Role": {"Label": "assistant"}, "Items": [{"$type": "TextContent", "Text": "hi"}]}]
+    s = ingest([(_conv_bytes(msgs), "u")]).samples[0]
+    assert s.request.input_messages[0].content == "hello" and s.golden.text == "hi"
+
+
+def test_conversation_not_ending_on_assistant_dropped():
+    _, drop, shape = normalize_row(RawRow(data={"__conversation__": [_sk("user", "only a prompt")]},
+                                          object_uri="x", row_index=0))
+    assert shape == Shape.CONVERSATION and drop.eval_block_reason == DropReason.EMPTY_RESPONSE
+
+
+def test_conversation_tool_turn_dropped_as_unsupported():
+    msgs = [_sk("user", "look it up"), _sk("tool", "result"), _sk("assistant", "done")]
+    res = ingest([(_conv_bytes(msgs), "u")])
+    assert res.report.evaluable == 0
+    assert res.dropped[0].eval_block_reason == DropReason.TOOL_CALLS_UNSUPPORTED
+
+
+def test_array_of_log_rows_is_not_mistaken_for_a_conversation():
+    rows = [{"request_id": "r1", "role": "user", "content": "x",
+             "messages": [{"role": "user", "content": "x"}],
+             "response": {"choices": [{"message": {"content": "y"}}]}}]
+    res = ingest([(json.dumps(rows).encode(), "u")])
+    assert res.samples[0].source.shape == Shape.CHAT_COMPLETIONS
+
+
+def test_zip_of_conversation_files_consolidates():
+    import io
+    import zipfile
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("case_1_step_a.json", _conv_bytes([_sk("user", "a"), _sk("assistant", "A")]))
+        zf.writestr("case_1_step_b.json",
+                    _conv_bytes([_sk("assistant", "persona"), _sk("user", "b"), _sk("assistant", "B")]))
+    from modelshift.sources import load_zip_bytes
+    objects, skipped = load_zip_bytes(buf.getvalue(), "upload:z")
+    res = ingest(objects, skipped_objects=skipped)
+    assert res.report.found == 2 and res.report.evaluable == 2 and res.report.reconciles()
+    assert len({s.id for s in res.samples}) == 2

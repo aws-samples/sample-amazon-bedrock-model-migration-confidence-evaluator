@@ -3,8 +3,10 @@
 Turns heterogeneous LiteLLM logs (file or S3) into a uniform set of
 NormalizedSample records with full drop-reason accounting.
 
-Container detection:      JSONL | JSON array | {data:[...]} / single-array-key wrapper
+Container detection:      JSONL | JSON array | {data:[...]} / single-array-key wrapper | single object
 Recognized row shapes:    SpendLogs (A) | wrapped SDK (B) | Chat Completions (C) | Responses (D)
+                          | Prompt capture (flat system_prompt/user_prompt/response)
+                          | Conversation (bare JSON array of messages, e.g. Semantic Kernel ChatHistory)
                           + Shape E (unknown / non-eval)
 Canonical request:        system/developer -> instructions; turns -> input_messages (multi-turn kept)
 Evaluability (E1-E4):     non-empty prompt AND usable golden AND text modality AND shape A-D
@@ -54,16 +56,80 @@ def _maybe_gunzip(raw: bytes) -> bytes:
     return raw
 
 
+def _is_prompt_capture(row: Any) -> bool:
+    """Flat app-side capture: user_prompt string + response, no chat `messages`."""
+    return (
+        isinstance(row, dict)
+        and isinstance(row.get("user_prompt"), str)
+        and "response" in row
+        and "messages" not in row
+        and "proxy_server_request" not in row
+    )
+
+
+_ROW_MARKERS = ("messages", "proxy_server_request", "request_id", "response", "user_prompt")
+
+
+def _msg_role(m: Dict[str, Any]) -> Optional[str]:
+    """Role of a transcript message: 'role'/'Role', as a string or Semantic Kernel {'Label': ...}."""
+    r = m.get("role", m.get("Role"))
+    if isinstance(r, dict):
+        r = r.get("Label", r.get("label"))
+    return r.strip().lower() if isinstance(r, str) and r.strip() else None
+
+
+def _msg_text(m: Dict[str, Any]) -> Tuple[Optional[str], Modality]:
+    """Text of a transcript message: 'content'/'Content', else Semantic Kernel 'Items'[].Text."""
+    content = m.get("content", m.get("Content"))
+    if content is not None:
+        return _text_of_content(content)
+    parts: List[str] = []
+    modality = Modality.TEXT
+    for item in m.get("Items") or m.get("items") or []:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("$type", "")).lower()
+        if "image" in kind:
+            modality = Modality.CONTAINS_IMAGE
+        elif "audio" in kind:
+            modality = Modality.CONTAINS_AUDIO
+        text = item.get("Text", item.get("text"))
+        if isinstance(text, str) and text:
+            parts.append(text)
+    return ("\n".join(parts) if parts else None), modality
+
+
+def _is_message_list(obj: Any) -> bool:
+    """A non-empty JSON array whose every element is a chat message (has a role and
+    content/Items) and none looks like a log ROW -- i.e. one bare transcript."""
+    if not isinstance(obj, list) or not obj:
+        return False
+    for m in obj:
+        if not isinstance(m, dict) or _msg_role(m) is None:
+            return False
+        if not any(k in m for k in ("content", "Content", "Items", "items")):
+            return False
+        if any(k in m for k in _ROW_MARKERS):
+            return False
+    return True
+
+
 def detect_container(text: str) -> Container:
-    """Sniff container: {data:[...]}/single-array-key -> array -> JSONL (Doc 2 §2.2)."""
+    """Sniff container: {data:[...]}/single-array-key -> array -> single object -> JSONL (Doc 2 §2.2)."""
     stripped = text.lstrip("\ufeff \t\r\n")
     if stripped.startswith("{"):
         try:
             obj = json.loads(stripped)
             if isinstance(obj, dict):
+                # A capture record is a row in its own right, even if it carries a list field.
+                if _is_prompt_capture(obj):
+                    return Container.SINGLE_OBJECT
                 array_keys = [k for k, v in obj.items() if isinstance(v, list)]
                 if array_keys:
                     return Container.WRAPPED_DATA
+                # The whole text parsed as ONE object (e.g. pretty-printed): it is a single row,
+                # not JSONL. Splitting it by line would turn every line into a parse error.
+                return Container.SINGLE_OBJECT
         except json.JSONDecodeError:
             pass
         # object-per-line JSONL also starts with '{'
@@ -90,8 +156,15 @@ def iter_rows(raw_bytes: bytes, object_uri: str) -> Iterator[RawRow]:
     """Yield RawRow items from a single log object, streaming JSONL where possible."""
     text = _maybe_gunzip(raw_bytes).decode("utf-8", errors="replace")
     container = detect_container(text)
+    if container == Container.SINGLE_OBJECT:
+        yield RawRow(data=json.loads(text.lstrip("\ufeff \t\r\n")), object_uri=object_uri, row_index=0)
+        return
     if container in (Container.WRAPPED_DATA, Container.JSON_ARRAY):
         obj = json.loads(text.lstrip("\ufeff \t\r\n"))
+        if _is_message_list(obj):
+            # The whole array is ONE transcript (one LLM call), not one row per message.
+            yield RawRow(data={"__conversation__": obj}, object_uri=object_uri, row_index=0)
+            return
         rows = _rows_from_wrapped(obj) if isinstance(obj, dict) else obj
         for i, row in enumerate(rows):
             if isinstance(row, dict):
@@ -117,6 +190,8 @@ def iter_rows(raw_bytes: bytes, object_uri: str) -> Iterator[RawRow]:
 def classify(row: Dict[str, Any]) -> Shape:
     if row.get("__parse_error__"):
         return Shape.UNKNOWN
+    if isinstance(row.get("__conversation__"), list):
+        return Shape.CONVERSATION
     call_type = row.get("call_type")
     resp = row.get("response") or {}
     resp_obj = resp.get("object") if isinstance(resp, dict) else None
@@ -126,6 +201,10 @@ def classify(row: Dict[str, Any]) -> Shape:
         return Shape.UNKNOWN
     if resp_obj in {"list", "chat.completion.chunk"}:
         return Shape.UNKNOWN
+
+    # Prompt capture — flat system_prompt / user_prompt / response strings
+    if _is_prompt_capture(row):
+        return Shape.PROMPT_CAPTURE
 
     # Shape A — SpendLogs: proxy_server_request present, or spend+request_id with empty top messages
     top_messages = row.get("messages")
@@ -347,10 +426,23 @@ def _usage_of(row: Dict[str, Any]) -> Usage:
     if isinstance(uobj, dict):
         ctd = uobj.get("completion_tokens_details") or {}
         reasoning = ctd.get("reasoning_tokens")
+    # Capture-style nested usage: {"usage": {"input_tokens", "output_tokens", ...}}
+    nested = row.get("usage") if isinstance(row.get("usage"), dict) else {}
+    prompt_tokens = row.get("prompt_tokens")
+    if prompt_tokens is None:
+        prompt_tokens = nested.get("prompt_tokens", nested.get("input_tokens"))
+    completion_tokens = row.get("completion_tokens")
+    if completion_tokens is None:
+        completion_tokens = nested.get("completion_tokens", nested.get("output_tokens"))
+    total_tokens = row.get("total_tokens")
+    if total_tokens is None:
+        total_tokens = nested.get("total_tokens")
+        if total_tokens is None and isinstance(prompt_tokens, int) and isinstance(completion_tokens, int):
+            total_tokens = prompt_tokens + completion_tokens
     return Usage(
-        prompt_tokens=row.get("prompt_tokens"),
-        completion_tokens=row.get("completion_tokens"),
-        total_tokens=row.get("total_tokens"),
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=total_tokens,
         reasoning_tokens=reasoning,
         spend=row.get("spend"),
     )
@@ -411,11 +503,91 @@ def adapt_responses(row: Dict[str, Any]) -> Tuple[SampleRequest, Golden]:
     return req, golden
 
 
+def adapt_prompt_capture(row: Dict[str, Any]) -> Tuple[SampleRequest, Golden]:
+    """Flat capture record -> canonical request + golden.
+
+    system_prompt -> instructions, user_prompt -> single user turn,
+    response (string, or a Chat Completions object) -> golden.
+    A non-2xx status_code means the response is an error body, not a baseline answer.
+    """
+    system = row.get("system_prompt")
+    user = row.get("user_prompt")
+    req = SampleRequest(
+        instructions=system if isinstance(system, str) and system.strip() else None,
+        input_messages=[Message(role="user", content=user)] if isinstance(user, str) and user.strip() else [],
+    )
+    status = row.get("status_code")
+    resp = row.get("response")
+    if isinstance(status, int) and not 200 <= status < 300:
+        return req, Golden(kind=GoldenKind.EMPTY, raw={"status_code": status, "response": resp})
+    if isinstance(resp, dict):
+        golden = _golden_from_chat_response(resp) if "choices" in resp else _golden_from_responses(resp)
+    elif isinstance(resp, str) and resp.strip():
+        golden = Golden(kind=GoldenKind.JSON if _looks_json(resp) else GoldenKind.TEXT,
+                        text=resp, raw={"response": resp})
+    else:
+        golden = Golden(kind=GoldenKind.EMPTY, raw={"response": resp})
+    return req, golden
+
+
+def adapt_conversation(row: Dict[str, Any]) -> Tuple[SampleRequest, Golden]:
+    """Bare transcript -> canonical request + golden.
+
+    - The final message, if it is an assistant turn, is the golden; everything before it
+      is the replayed request. A transcript that does not end on an assistant turn has no
+      baseline answer (EMPTY golden -> dropped as empty_response).
+    - system/developer messages, and any assistant messages BEFORE the first user turn,
+      become instructions: an assistant turn can't precede the first prompt, so those are
+      persona/system text the app sent under the wrong role.
+    - Later assistant turns stay in context (multi-turn); tool/function turns mark the row
+      as a tool round-trip (unsupported for replay, same rule as the other shapes).
+    """
+    msgs = [m for m in row.get("__conversation__") or [] if isinstance(m, dict)]
+    golden = Golden(kind=GoldenKind.EMPTY, raw={"messages": len(msgs)})
+    if msgs and _msg_role(msgs[-1]) == "assistant":
+        text, _ = _msg_text(msgs[-1])
+        if text and text.strip():
+            golden = Golden(kind=GoldenKind.JSON if _looks_json(text) else GoldenKind.TEXT,
+                            text=text, raw={"messages": len(msgs)})
+        msgs = msgs[:-1]
+
+    instructions: List[str] = []
+    turns: List[Message] = []
+    modality = Modality.TEXT
+    had_tools = False
+    seen_user = False
+    for m in msgs:
+        role = _msg_role(m) or "user"
+        text, mod = _msg_text(m)
+        if mod != Modality.TEXT:
+            modality = mod
+        if role in ("tool", "function"):
+            had_tools = True
+            continue
+        if role in ("system", "developer") or (role == "assistant" and not seen_user):
+            if text and text.strip():
+                instructions.append(text)
+            continue
+        if role == "user":
+            seen_user = True
+        if text and text.strip():
+            turns.append(Message(role=role if role in ("user", "assistant") else "user", content=text))
+    req = SampleRequest(
+        instructions="\n".join(instructions) if instructions else None,
+        input_messages=turns,
+        modality=modality,
+        had_tool_calls=had_tools,
+    )
+    return req, golden
+
+
 ADAPTERS = {
+    Shape.CONVERSATION: adapt_conversation,
     Shape.SPENDLOGS: adapt_spendlogs,
     Shape.WRAPPED: adapt_wrapped,
     Shape.CHAT_COMPLETIONS: adapt_chat_completions,
     Shape.RESPONSES: adapt_responses,
+    Shape.PROMPT_CAPTURE: adapt_prompt_capture,
 }
 
 
@@ -529,6 +701,15 @@ def ingest(objects: Iterable[Tuple[bytes, str]], skipped_objects: int = 0) -> In
     user_counts: Dict[str, int] = {}
     found = 0
     redacted = 0
+    # Sample ids key results, scores, caches and reports, so they MUST be unique within a run.
+    # Several log files can share one request_id (e.g. one end-user request that fanned out
+    # into many LLM calls, one capture file per call): later repeats get '#2', '#3', ...
+    seen_ids: Dict[str, int] = {}
+
+    def _unique(base: str) -> str:
+        n = seen_ids.get(base, 0) + 1
+        seen_ids[base] = n
+        return base if n == 1 else f"{base}#{n}"
 
     for raw_bytes, uri in objects:
         for raw in iter_rows(raw_bytes, uri):
@@ -536,6 +717,10 @@ def ingest(objects: Iterable[Tuple[bytes, str]], skipped_objects: int = 0) -> In
             sample, drop, shape = normalize_row(raw)
             shape_counts[shape] = shape_counts.get(shape, 0) + 1
             if sample is not None:
+                uid = _unique(sample.id)
+                if uid != sample.id:
+                    sample = sample.model_copy(update={
+                        "id": uid, "tags": {**sample.tags, "request_id": sample.id}})
                 result.samples.append(sample)
                 m = sample.legacy_model or "unknown"
                 model_counts[m] = model_counts.get(m, 0) + 1
@@ -546,12 +731,19 @@ def ingest(objects: Iterable[Tuple[bytes, str]], skipped_objects: int = 0) -> In
                 if u:
                     user_counts[str(u)] = user_counts.get(str(u), 0) + 1
             else:
+                uid = _unique(drop.id)
+                if uid != drop.id:
+                    drop = drop.model_copy(update={"id": uid})
                 result.dropped.append(drop)
                 dropped_counts[drop.eval_block_reason] = dropped_counts.get(drop.eval_block_reason, 0) + 1
                 if drop.eval_block_reason == DropReason.REDACTED:
                     redacted += 1
 
-    total_rows = max(found, 1)
+    # Skipped non-log objects are part of what was "found" (Doc 2 §6.3 identity:
+    # found = evaluable + Σ dropped + skipped_objects).
+    rows_seen = found
+    found += skipped_objects
+    total_rows = max(rows_seen, 1)
     result.report = IngestionReport(
         found=found,
         evaluable=len(result.samples),

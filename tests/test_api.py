@@ -50,7 +50,9 @@ def _sample(sid, prompt, golden):
 
 
 # ------------------------------ orchestrator ------------------------------- #
-def test_orchestrator_mantle_without_transport_fails_clearly():
+def test_orchestrator_mantle_without_transport_fails_clearly(monkeypatch):
+    from modelshift.config import MODEL_CATALOG
+    monkeypatch.setattr(MODEL_CATALOG["gpt-5.4"], "runtime_supported", False)  # simulate mantle-only
     run = Run(run_id="rm", name="t")
     run.samples = [_sample("1", "hi", "hi")]
     run.config = RunConfig(candidates=[CandidateConfig(model="gpt-5.4")],
@@ -81,7 +83,7 @@ def test_run_persistence_roundtrip(tmp_path, monkeypatch):
     assert r2.status.value == "done"
     assert len(r2.samples) == 1
     assert len(r2.verdicts) == 1
-    assert r2.verdicts[0].model == "gpt-5.6-luna"
+    assert r2.verdicts[0].model == "gpt-5.6-luna@medium"
     assert r2.config.candidates[0].model == "gpt-5.6-luna"
 
 
@@ -99,7 +101,7 @@ def test_orchestrator_claude_uses_converse_transport():
                  converse_transport=_converse).run(run)
     assert run.status.value == "done"
     assert seen["model"] == "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
-    assert run.verdicts[0].model == "claude-sonnet-4.5"
+    assert run.verdicts[0].model == "claude-sonnet-4.5@medium"
 
 
 def test_default_candidates_from_matrix():
@@ -138,7 +140,7 @@ def test_orchestrator_full_pipeline_compatible():
     assert run.status == RunStatus.DONE
     assert len(run.verdicts) == 1
     v = run.verdicts[0]
-    assert v.model == "gpt-5.6-luna"
+    assert v.model == "gpt-5.6-luna@medium"
     assert v.scored == 2
     assert v.migration_confidence == 100.0  # both exact matches -> compatible
 
@@ -303,7 +305,8 @@ def test_api_unmapped_legacy_model_falls_back_and_runs():
     assert plan.json()["estimated_calls"] >= 1
 
 
-def test_api_gpt54_forces_mantle_endpoint():
+def test_api_gpt54_stays_on_runtime_endpoint():
+    # GPT-5.4 is on bedrock-runtime now (us.openai.gpt-5.4), so it no longer forces mantle.
     c = _client()
     run_id = c.post("/api/v1/runs", json={"name": "m"}).json()["run_id"]
     row = {"request_id": "u1", "model": "gpt-5.4", "messages": {},
@@ -314,7 +317,19 @@ def test_api_gpt54_forces_mantle_endpoint():
     data = _j.dumps({"data": [row]}).encode()
     up = c.post("/api/v1/uploads", files={"file": ("u.json", data, "application/json")}).json()
     c.post(f"/api/v1/runs/{run_id}/ingest", json={"upload_id": up["upload_id"]})
-    # request runtime, but GPT-5.4 is mantle-only -> resolver forces mantle
+    c.post(f"/api/v1/runs/{run_id}/plan",
+           json={"candidates": [{"model": "gpt-5.4"}], "bedrock_endpoint": "runtime"})
+    assert api_mod._RUNS[run_id].config.bedrock_endpoint == "runtime"
+
+
+def test_api_mantle_only_model_forces_mantle_endpoint(monkeypatch):
+    # The generic mechanism still works for any model flagged runtime_supported=False.
+    from modelshift.config import MODEL_CATALOG
+    monkeypatch.setattr(MODEL_CATALOG["gpt-5.4"], "runtime_supported", False)
+    c = _client()
+    run_id = c.post("/api/v1/runs", json={"name": "m"}).json()["run_id"]
+    c.post(f"/api/v1/runs/{run_id}/ingest",
+           json={"manual_prompts": [{"prompt": "hi", "golden": "hello"}]})
     c.post(f"/api/v1/runs/{run_id}/plan",
            json={"candidates": [{"model": "gpt-5.4"}], "bedrock_endpoint": "runtime"})
     assert api_mod._RUNS[run_id].config.bedrock_endpoint == "mantle"
@@ -516,20 +531,22 @@ def test_litellm_call_path_uses_litellm_transport():
     assert a._transport is lite  # the proxy transport, not the Bedrock one
 
 
-def test_runtime_model_uses_runtime_even_in_mantle_run():
-    # A runtime-capable model (Luna) must NOT be routed to mantle even if the
-    # run's endpoint was forced to mantle by a mantle-only sibling (GPT-5.4).
+def test_runtime_model_uses_runtime_even_in_mantle_run(monkeypatch):
+    # A runtime-capable model (Luna, GPT-5.4) must NOT be routed to mantle even if the
+    # run's endpoint was forced to mantle by a mantle-only sibling.
     from modelshift.orchestrator import Orchestrator, RunConfig, CandidateConfig
     from modelshift.adapters import BedrockResponsesAdapter
+    from modelshift.config import MODEL_CATALOG
     orch = Orchestrator(candidate_transport=lambda p: {"output_text": "x", "usage": {}},
                         mantle_transport=lambda p: {"output_text": "m", "usage": {}})
     cfg = RunConfig(candidates=[CandidateConfig(model="gpt-5.6-luna")], bedrock_endpoint="mantle")
     a = orch._adapter_for(cfg, "gpt-5.6-luna")
     assert isinstance(a, BedrockResponsesAdapter)
     assert a._endpoint == "runtime"  # Luna is runtime_supported → runtime, not mantle
-    # GPT-5.4 (mantle-only) still goes to mantle
-    a54 = orch._adapter_for(cfg, "gpt-5.4")
-    assert a54._endpoint == "mantle"
+    assert orch._adapter_for(cfg, "gpt-5.4")._endpoint == "runtime"  # GPT-5.4 is on runtime now
+    # A model flagged mantle-only still goes to mantle.
+    monkeypatch.setattr(MODEL_CATALOG["gpt-5.4"], "runtime_supported", False)
+    assert orch._adapter_for(cfg, "gpt-5.4")._endpoint == "mantle"
 
 
 def test_sampling_first_n_limits_subset():
@@ -648,7 +665,7 @@ def test_api_transcript_paginated(tmp_path, monkeypatch):
     it = page1["items"][0]
     assert it["request"]["messages"][0]["content"].startswith("q")
     assert it["original_response"]["text"].startswith("a")
-    assert it["candidate_model"] == "gpt-5.6-luna"
+    assert it["candidate_model"] == "gpt-5.6-luna@medium"
     page2 = c.get(f"/api/v1/runs/{run_id}/transcript?candidate=gpt-5.6-luna&limit=25&offset=25").json()
     assert len(page2["items"]) == 5
 
@@ -675,7 +692,7 @@ def test_api_sample_detail_join(tmp_path, monkeypatch):
     assert det["original"]["latency_ms"] == 900
     assert det["original"]["messages"][0]["content"] == "capital of France?"
     assert det["original"]["response"]["text"] == "Paris"
-    assert det["candidate_result"]["model"] == "gpt-5.6-luna"
+    assert det["candidate_result"]["model"] == "gpt-5.6-luna@medium"
     assert det["candidate_result"]["latency_ms"] is not None
     assert det["score"] is not None
 

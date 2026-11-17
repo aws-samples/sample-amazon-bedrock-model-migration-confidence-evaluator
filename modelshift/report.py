@@ -12,6 +12,45 @@ from collections import Counter
 from typing import Any, Dict, List
 
 from .config import DEFAULT_SETTINGS
+from .recommend import NO_CACHING_CAVEAT, REPRICED_CAVEAT
+
+# Per-candidate multi-objective metrics copied into the report (spec R7.5).
+_MULTI_OBJECTIVE_FIELDS = (
+    "cost_known", "ok_calls", "cost_per_request", "cost_per_1k_requests", "cost_vs_current_pct",
+    "projected_monthly_cost", "avg_output_tokens", "avg_reasoning_tokens", "output_token_ratio",
+    "ms_per_output_token_p50", "latency_samples", "latency_low_confidence", "error_rate",
+    "eligible", "ineligible_reasons",
+)
+# Request replays / D7 Consistency (replay-consistency spec).
+_CONSISTENCY_FIELDS = (
+    "replays", "requests_scored", "consistency", "consistency_measured", "consistency_low_confidence",
+    "unstable_requests", "flip_rate", "unstable", "latency_spread_p50",
+)
+
+
+def _exec_summary(stats):
+    from .concurrency import exec_summary
+    return exec_summary(stats)
+
+
+def _latency_disclaimer(run) -> str:
+    n = run.config.parallelism if getattr(run, "config", None) else 1
+    base = DEFAULT_SETTINGS.latency_disclaimer
+    if n > 1 and getattr(run, "exec_stats", None):
+        return base.rstrip() + f" Measured with {n} parallel calls, which can add some latency per call."
+    return base
+
+
+def _least_consistent(run, model: str, limit: int = 10) -> List[Dict[str, Any]]:
+    """Lowest-D7 requests for a candidate (empty when replays were off)."""
+    if not run.config or (getattr(run.config, "replays", 1) or 1) < 2:
+        return []
+    from .consistency import requests_for
+    rows = [rc for rc in requests_for(model, run.results, run.pair_scores,
+                                      DEFAULT_SETTINGS.instability_threshold) if rc.d7 is not None]
+    rows.sort(key=lambda rc: (rc.d7, rc.sample_id))
+    return [{"sample_id": rc.sample_id, "d7": rc.d7, "labels": [lb.value for lb in rc.labels],
+             "flip": rc.flip, "unstable": rc.unstable} for rc in rows[:limit]]
 
 
 def _pct(vals: List[float], q: float):
@@ -95,12 +134,18 @@ def _evaluations_for(run, model: str) -> Dict[str, Any]:
     """Per-evaluation rows for one candidate (first APPENDIX_LIMIT), mirroring the
     UI drill-down: request, golden, candidate response, per-dimension scores +
     reasons, judge assessment, hard-break, label, latency, cost."""
-    results_by_id = {r.sample_id: r for r in run.results if r.model == model}
-    scores_by_id = {p.sample_id: p for p in run.pair_scores if p.model == model}
+    results_by_id = {(r.sample_id, r.replay_index): r for r in run.results if r.model == model}
+    scores_by_id = {(p.sample_id, p.replay_index): p for p in run.pair_scores if p.model == model}
+    reps = sorted({k[1] for k in results_by_id} | {k[1] for k in scores_by_id}) or [0]
+    d7 = {}
+    if len(reps) > 1:
+        from .consistency import requests_for
+        d7 = {rc.sample_id: rc for rc in requests_for(model, run.results, run.pair_scores,
+                                                      DEFAULT_SETTINGS.instability_threshold)}
     rows: List[Dict[str, Any]] = []
-    for s in run.samples:
-        res = results_by_id.get(s.id)
-        score = scores_by_id.get(s.id)
+    for s, rep in ((s, rep) for s in run.samples for rep in reps):
+        res = results_by_id.get((s.id, rep))
+        score = scores_by_id.get((s.id, rep))
         if res is None and score is None:
             continue
         dims = []
@@ -117,6 +162,10 @@ def _evaluations_for(run, model: str) -> Dict[str, Any]:
             label = res.status
         rows.append({
             "sample_id": s.id,
+            "replay_index": rep,
+            "replays": len(reps),
+            "consistency": (d7[s.id].d7 if s.id in d7 else None),
+            "unstable": (d7[s.id].unstable if s.id in d7 else False),
             "label": label,
             "hard_break": bool(score.hard_break) if score else False,
             "overridden": bool(score.overridden) if score else False,
@@ -145,6 +194,8 @@ def _evaluations_for(run, model: str) -> Dict[str, Any]:
 
 def build_run_report(run) -> Dict[str, Any]:
     """Assemble the full report payload for a run from existing computed state."""
+    from .recommend import run_recommendation
+    rec = run_recommendation(run, DEFAULT_SETTINGS) if run.verdicts else None  # refreshes verdicts
     candidates: List[Dict[str, Any]] = []
     for v in run.verdicts:
         # Distinct per-call errors for this candidate (deduped by message).
@@ -158,6 +209,8 @@ def build_run_report(run) -> Dict[str, Any]:
             "model": v.model,
             "endpoint": v.endpoint,
             "migration_confidence": v.migration_confidence,
+            "confidence_ci_low": v.confidence_ci_low,       # 95% bootstrap interval
+            "confidence_ci_high": v.confidence_ci_high,
             "verdict_band": v.verdict_band.value,
             "distribution": {k.value: n for k, n in (v.distribution or {}).items()},
             "dimension_averages": v.dimension_averages,
@@ -169,6 +222,9 @@ def build_run_report(run) -> Dict[str, Any]:
             "latency_p95_ms": v.latency_p95_ms,
             "scored": v.scored,
             "errored": v.errored,
+            **{k: getattr(v, k) for k in _MULTI_OBJECTIVE_FIELDS},
+            **{k: getattr(v, k) for k in _CONSISTENCY_FIELDS},
+            "least_consistent": _least_consistent(run, v.model),
             "errors": errs,
             "evaluations": _evaluations_for(run, v.model),
         })
@@ -183,6 +239,8 @@ def build_run_report(run) -> Dict[str, Any]:
                 "confidence_run_before": r.confidence_run_before,
                 "confidence_run_after": r.confidence_run_after,
                 "moved": dict(r.moved or {}), "regression_checked": r.regression_checked,
+                "replays": r.replays, "consistency_before": r.consistency_before,
+                "consistency_after": r.consistency_after,
                 "cost": r.cost, "finished_at": r.finished_at,
                 "change": r.change.model_dump() if r.change else None}
 
@@ -205,12 +263,22 @@ def build_run_report(run) -> Dict[str, Any]:
         "description": run.description or "",
         "status": run.status.value,
         "error": run.error,
+        "replays": (max(1, int(getattr(run.config, "replays", 1) or 1)) if run.config else 1),
+        "parallelism": (run.config.parallelism if run.config else 1),
+        "exec_stats": getattr(run, "exec_stats", None),
+        "exec_summary": _exec_summary(getattr(run, "exec_stats", None)),
         "source": _source_summary(run),
         "candidates": candidates,
+        # "best" keeps its original meaning: best by FIT (Migration Confidence). The
+        # all-things-considered pick lives in recommendation.profiles[best_overall].
         "best": candidates[0] if candidates else None,
+        "recommendation": rec.model_dump(mode="json") if rec else None,
+        "weights": run.weights.model_dump(mode="json") if getattr(run, "weights", None) else None,
+        "latency_disclaimer": _latency_disclaimer(run),
         "remediations": remediations,
         "top_failure_reasons_overall": [{"reason": r, "count": n} for r, n in reason_totals.most_common(6)],
-        "caveats": _caveats(run),
+        "caveats": _caveats(run) + ([NO_CACHING_CAVEAT, REPRICED_CAVEAT, DEFAULT_SETTINGS.latency_disclaimer]
+                                    if candidates else []),
     }
 
 

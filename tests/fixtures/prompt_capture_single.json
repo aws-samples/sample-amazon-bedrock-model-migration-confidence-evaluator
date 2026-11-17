@@ -1,0 +1,15 @@
+{
+  "captured_at": "2026-09-08T03:16:00.503724+00:00",
+  "request_id": "CAP-0001",
+  "model": "gpt41-deployment:analyze",
+  "version": "api-version=2025-01-01-preview",
+  "system_prompt": "You are a helpful AI assistant.",
+  "user_prompt": "Compare the two extractions below and return a JSON list with one result.\nA: {'Copay': '2.5x'}\nB: {'Copay': '2.5x'}",
+  "response": "[\n  {\"SNO\": 1, \"ShowMatch\": \"MATCH\", \"Comments\": \"\"}\n]",
+  "status_code": 200,
+  "usage": {
+    "input_tokens": 120,
+    "output_tokens": 30,
+    "cached_tokens": 64
+  }
+}

@@ -45,6 +45,7 @@ const DIMENSIONS = [
   { key: "d4_verbosity", code: "D4", name: "Verbosity", desc: "Response length is comparable — not materially longer or shorter." },
   { key: "d5_instruction", code: "D5", name: "Instruction-following", desc: "Honors the system/instructions the original also had to follow." },
   { key: "d6_tool_call", code: "D6", name: "Tool-call match", desc: "Same function name + argument schema (tool-call responses only).", hard: true },
+  { key: "d7_consistency", code: "D7", name: "Consistency", desc: "How alike the model's answers are when the same request is replayed (replays only). Doesn't change any answer's label or Migration Confidence." },
 ];
 const JUDGE_REASON_TEXT = {
   equivalent: "Judge found the candidate interchangeable with the original.",
@@ -95,6 +96,11 @@ async function boot() {
         "build ", h("code", {}, ver.build_id || "?")),
       h("div", { style: "font-size:10px;opacity:.7" }, "up since " + (ver.started_at ? ver.started_at.replace("T", " ").replace("+00:00", "Z") : "?")));
   } catch (e) { $("#apiStatus").textContent = "API offline"; }
+  // Deep link: ?run=<run_id> opens that run directly (shareable; ids are validated by the API).
+  const linkRun = new URLSearchParams(location.search).get("run");
+  if (linkRun && /^[A-Za-z0-9_-]{1,64}$/.test(linkRun)) { go("run", linkRun); return; }
+  const linkView = new URLSearchParams(location.search).get("view");
+  if (["settings", "guide", "runs"].includes(linkView)) { go(linkView); return; }
   go("runs");
 }
 
@@ -114,6 +120,104 @@ async function render(view, arg) {
   if (view === "guide") return renderGuide(main);
 }
 
+// ---- Runs list (Option A): summary tiles, search + status filters, sort, and per-run rows
+// with the Best overall pick and a confidence strip of every candidate. Live runs show progress.
+const runsUi = { filter: "all", q: "", sort: "newest" };
+const RUN_STATUS = {
+  done: ["ok", "✓ Done"], failed: ["bad", "✗ Failed"], cancelled: ["mu", "Cancelled"],
+  ingested: ["run", "● Ready to configure"], created: ["mu", "Created"], ingesting: ["run", "● Loading logs"],
+  planning: ["run", "● Running"], replaying: ["run", "● Running"], scoring: ["run", "● Running"], aggregating: ["run", "● Finishing"],
+};
+const LIVE = new Set(["planning", "replaying", "scoring", "aggregating", "ingesting"]);
+const runGroup = (r) => r.status === "done" ? "done" : r.status === "failed" ? "failed"
+  : LIVE.has(r.status) ? "running" : "notrun";
+const runWhen = (ts) => {
+  if (!ts) return ["—", ""];
+  const d = new Date(ts * 1000), now = new Date();
+  const t = d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  const sameDay = (a, b) => a.toDateString() === b.toDateString();
+  const yest = new Date(now); yest.setDate(now.getDate() - 1);
+  const label = sameDay(d, now) ? `Today ${t}` : sameDay(d, yest) ? `Yesterday ${t}`
+    : `${d.toLocaleDateString([], { month: "short", day: "numeric", ...(d.getFullYear() !== now.getFullYear() ? { year: "numeric" } : {}) })} ${t}`;
+  const mins = Math.max(0, Math.round((now - d) / 60000));
+  const ago = mins < 1 ? "just now" : mins < 60 ? `${mins} min ago` : mins < 1440 ? `${Math.round(mins / 60)} h ago`
+    : `${Math.round(mins / 1440)} day${Math.round(mins / 1440) === 1 ? "" : "s"} ago`;
+  return [label, ago];
+};
+const bestConf = (r) => Math.max(-1, ...(r.verdict_summary || []).map(v => v.confidence ?? -1));
+
+// Every candidate's confidence on one 0–100 line; recommended one ringed; gate tick marked.
+function confStrip(r) {
+  const vs = r.verdict_summary || [];
+  if (!vs.length) return h("span", { class: "muted" }, "—");
+  const gate = (SETTINGS && SETTINGS.recommendation && SETTINGS.recommendation.min_confidence) ?? 65;
+  const desc = vs.map(v => `${v.model} ${Math.round(v.confidence)}% (${BAND_TEXT[v.band] || v.band})`).join(", ");
+  return h("div", {},
+    h("div", { class: "cstrip", role: "img", title: desc,
+      "aria-label": `Candidate confidence: ${desc}. Quality gate at ${gate}.` + (r.best_overall ? ` Recommended: ${r.best_overall}.` : "") },
+      h("span", { class: "gate", style: `left:${gate}%` }),
+      ...[...vs].sort((a, b) => (a.model === r.best_overall) - (b.model === r.best_overall)).map(v =>
+        h("i", { class: v.model === r.best_overall ? "best" : "",
+          style: `left:${Math.max(0, Math.min(100, v.confidence || 0))}%;background:${BAND_COLOR[v.band] || "var(--muted)"}` }))),
+    h("div", { class: "sub" }, `${vs.length} candidate${vs.length === 1 ? "" : "s"}`));
+}
+
+function runRecCell(r) {
+  if (r.status === "failed") return h("div", { class: "errline", title: r.error || "" }, r.error || "Run failed");
+  if (r.progress) {
+    const p = r.progress, pct = p.total ? 100 * p.done / p.total : 0;
+    let left = "";
+    if (p.done > 0 && p.started_ts && p.last_ts && p.last_ts > p.started_ts && p.total > p.done)
+      left = ` · ~${fmtDur((p.total - p.done) * (p.last_ts - p.started_ts) / p.done)} left`;
+    return h("div", {},
+      h("div", { class: "rbar", role: "progressbar", "aria-valuemin": "0", "aria-valuemax": String(p.total || 0),
+        "aria-valuenow": String(p.done), "aria-label": `${p.done} of ${p.total} calls done` },
+        h("span", { style: `width:${pct}%` })),
+      h("div", { class: "sub" }, p.stage === "aggregating" ? "computing verdicts…" : `${p.done} / ${p.total || "?"} calls${left}`,
+        p.inflight ? ` · ${p.inflight} in flight` : "",
+        p.throttled ? h("span", { style: "color:var(--partial)" }, " · throttled") : ""));
+  }
+  if (r.status === "ingested") return h("div", { class: "row", style: "gap:8px" },
+    h("span", { class: "sub" }, "Logs loaded, not run yet"),
+    h("button", { class: "btn ghost sm", onclick: (e) => { e.stopPropagation(); continueSetup(r.run_id); } }, "Continue setup →"));
+  if (r.status === "cancelled") return h("span", { class: "sub" }, "Stopped before results");
+  if (r.status !== "done") return h("span", { class: "muted" }, "—");
+  if (r.none_eligible || !r.best_overall) return h("div", {},
+    h("span", { class: "band needs_work" }, "No candidate ready"),
+    h("div", { class: "sub" }, "none passed the quality gate"));
+  const b = (r.verdict_summary || []).find(v => v.model === r.best_overall) || {};
+  return h("div", {},
+    h("div", {}, h("span", { class: "mono" }, r.best_overall), " ", h("span", { class: "muted tnum" }, fmtPct(b.confidence ?? 0))),
+    h("div", { class: "row", style: "gap:6px;margin-top:2px" },
+      b.band ? h("span", { class: "band " + b.band }, BAND_TEXT[b.band]) : null, h("span", { class: "sub" }, "Best overall")));
+}
+
+async function continueSetup(runId) {
+  try {
+    const info = await api(`/runs/${runId}`);
+    state.draft = { name: info.name || "", step: "config", runId, ingestion: info.ingestion, candidates: [],
+                    callPath: "bedrock", endpoint: "bedrock_runtime", effort: "medium" };
+    go("new");
+  } catch (e) { alert("Could not open this run: " + (e && e.message ? e.message : "error")); }
+}
+
+function runMenu(r) {
+  const del = async (e) => {
+    e.stopPropagation();
+    if (!confirm(`Delete run "${r.name || r.run_id}"? This cannot be undone.`)) return;
+    try { await api(`/runs/${r.run_id}`, { method: "DELETE" }); go("runs"); }
+    catch (err) { alert("Delete failed: " + (err && err.message ? err.message : "error")); }
+  };
+  const menu = h("details", { class: "rowmenu", onclick: (e) => e.stopPropagation() },
+    h("summary", { "aria-label": `Actions for ${r.name || r.run_id}`, title: "Actions" }, "⋯"),
+    h("div", { class: "menu", role: "menu" },
+      h("button", { role: "menuitem", onclick: (e) => { e.stopPropagation(); r.status === "ingested" ? continueSetup(r.run_id) : go("run", r.run_id); } },
+        r.status === "done" ? "Open results" : r.status === "ingested" ? "Continue setup" : "Open"),
+      r.status === "done" ? h("a", { role: "menuitem", href: `${API}/runs/${r.run_id}/report.pdf`, target: "_blank", rel: "noopener" }, "Download PDF") : null,
+      LIVE.has(r.status) ? null : h("button", { role: "menuitem", class: "danger", onclick: del }, "Delete")));
+  return menu;
+}
+
 async function renderRuns(main) {
   main.append(topbar("Runs"));
   let runs = [];
@@ -125,27 +229,107 @@ async function renderRuns(main) {
       h("button", { class: "btn", onclick: () => go("new") }, "New Run")));
     return;
   }
-  const rows = runs.map(r => {
-    const delBtn = h("button", { class: "btn ghost", style: "padding:2px 8px;font-size:12px", title: "Delete run" }, "Delete");
-    delBtn.addEventListener("click", async (ev) => {
-      ev.stopPropagation();
-      if (!confirm(`Delete run "${r.name || r.run_id}"? This cannot be undone.`)) return;
-      try { await api(`/runs/${r.run_id}`, { method: "DELETE" }); go("runs"); }
-      catch (e) { alert("Delete failed: " + (e && e.message ? e.message : "error")); }
-    });
-    return h("tr", { onclick: () => go("run", r.run_id) },
-      h("td", { class: "mono" }, r.run_id),
-      h("td", {}, r.name),
-      h("td", {}, r.status),
-      h("td", {}, r.verdict_summary?.length
-        ? h("span", {}, `${r.verdict_summary[0].model} · ${fmtPct(r.verdict_summary[0].confidence)}`)
-        : h("span", { class: "muted" }, "—")),
-      h("td", {}, delBtn));
-  });
-  main.append(h("div", { class: "card" },
-    h("div", { class: "row spread" }, h("h3", {}, "All runs"), h("button", { class: "btn", onclick: () => go("new") }, "New Run")),
-    h("table", {}, h("thead", {}, h("tr", {}, ...["Run", "Name", "Status", "Top candidate", ""].map(t => h("th", {}, t)))),
-      h("tbody", {}, ...rows))));
+  const card = h("div", { class: "card runs" });
+  main.append(card);
+  // Server-wide parallel calls, shown when two or more runs are live (they share the cap).
+  const serverStrip = h("div", { class: "rp-now", style: "display:none;margin:0 0 10px" });
+  if (runs.filter(r => r.progress).length >= 2) {
+    api("/concurrency").then(cs => {
+      const waiting = (cs.runs || []).filter(x => x.waiting).length;
+      serverStrip.replaceChildren(h("b", {}, `${cs.server_inflight} of ${cs.server_cap}`),
+        ` calls in flight across ${(cs.runs || []).length} runs`,
+        waiting ? h("span", { style: "color:var(--partial)" }, ` · ${waiting} waiting for capacity`) : "",
+        h("span", { class: "muted" }, " · limit set in Settings"));
+      serverStrip.style.display = "";
+    }).catch(() => {});
+  }
+
+  const count = (g) => runs.filter(r => runGroup(r) === g).length;
+  const done = runs.filter(r => r.status === "done");
+  const live = runs.filter(r => r.progress);
+  const spend = runs.reduce((a, r) => a + (r.spend || 0), 0);
+  const oldest = Math.min(...runs.map(r => r.created_at || Infinity));
+  const tile = (l, v, s) => h("div", { class: "rp-kpi" }, h("div", { class: "l" }, l), h("div", { class: "v" }, v), h("div", { class: "s" }, s));
+  const liveDone = live.reduce((a, r) => a + (r.progress.done || 0), 0), liveTotal = live.reduce((a, r) => a + (r.progress.total || 0), 0);
+  const tiles = h("div", { class: "rp-kpis" },
+    tile("Runs", String(runs.length), isFinite(oldest) ? `since ${new Date(oldest * 1000).toLocaleDateString([], { month: "short", day: "numeric" })}` : ""),
+    tile("Completed", String(done.length), `${done.filter(r => r.none_eligible).length} with no candidate ready`),
+    tile("Running", String(live.length), live.length ? `${liveTotal ? Math.round(100 * liveDone / liveTotal) : 0}% of calls done` : "none right now"),
+    tile("Failed", String(count("failed")), count("failed") ? "open a run to see why" : "no failures"),
+    tile("Total spend", fmtUsd(spend), runs.some(r => r.spend_unknown) ? "some prices unknown" : "list price, no caching"));
+
+  const search = h("input", { type: "search", class: "runsearch", placeholder: "Search name, run ID or model…",
+    "aria-label": "Search runs", value: runsUi.q });
+  const segBtns = (opts, key, cb) => h("div", { class: "seg", role: "group" }, ...opts.map(([k, t]) =>
+    h("button", { class: runsUi[key] === k ? "active" : "", "aria-pressed": runsUi[key] === k ? "true" : "false",
+      onclick: () => { runsUi[key] = k; cb(); } }, t)));
+  const filters = () => segBtns([["all", ["All", h("span", { class: "n" }, String(runs.length))]],
+    ["done", ["Done", h("span", { class: "n" }, String(count("done")))]],
+    ["running", ["Running", h("span", { class: "n" }, String(count("running")))]],
+    ["failed", ["Failed", h("span", { class: "n" }, String(count("failed")))]],
+    ["notrun", ["Not run", h("span", { class: "n" }, String(count("notrun")))]]], "filter", draw);
+  const sorts = () => segBtns([["newest", "Newest"], ["name", "Name"], ["confidence", "Best confidence"]], "sort", draw);
+  const filterBox = h("span", {}), sortBox = h("span", {});
+  const tbody = h("tbody");
+  const empty = h("div", { class: "muted", style: "display:none;padding:14px 4px" }, "No runs match.");
+  const heads = [["Run"], ["Status"], ["When"], ["Evals", 1], ["Recommendation"], ["Candidates (confidence 0–100)"], ["Spend", 1], [""]];
+
+  function draw() {
+    filterBox.replaceChildren(filters()); sortBox.replaceChildren(sorts());
+    const q = runsUi.q.trim().toLowerCase();
+    let rows = runs.filter(r => runsUi.filter === "all" || runGroup(r) === runsUi.filter)
+      .filter(r => !q || [r.name, r.run_id, r.best_overall, ...(r.verdict_summary || []).map(v => v.model)]
+        .some(x => x && String(x).toLowerCase().includes(q)));
+    rows.sort(runsUi.sort === "name" ? (a, b) => (a.name || "").localeCompare(b.name || "")
+      : runsUi.sort === "confidence" ? (a, b) => bestConf(b) - bestConf(a)
+      : (a, b) => (b.created_at || 0) - (a.created_at || 0));
+    tbody.replaceChildren(...rows.map(r => {
+      const [whenTxt, ago] = runWhen(r.created_at);
+      const [cls, txt] = RUN_STATUS[r.status] || ["mu", r.status];
+      const open = () => (r.status === "ingested" ? continueSetup(r.run_id) : go("run", r.run_id));
+      return h("tr", { tabindex: "0", title: "Open this run", onclick: open,
+        onkeydown: (e) => { if (e.key === "Enter") { e.preventDefault(); open(); } } },
+        h("td", {}, h("div", { style: "font-weight:600" }, r.name || "untitled"), h("div", { class: "sub mono" }, r.run_id)),
+        h("td", {}, h("span", { class: "rst " + cls }, txt)),
+        h("td", {}, h("div", {}, whenTxt), h("div", { class: "sub" }, ago)),
+        h("td", { class: "num tnum" }, String(r.evaluations ?? "—"),
+          (r.replays || 1) > 1 ? h("span", { class: "chip", style: "margin-left:6px", title: `Each request sent ${r.replays} times` }, `×${r.replays}`) : null),
+        h("td", {}, runRecCell(r)),
+        h("td", {}, r.progress ? h("span", { class: "sub" }, "results when done") : confStrip(r)),
+        h("td", { class: "num tnum" }, r.spend == null ? h("span", { class: "muted" }, "—")
+          : [fmtUsd(r.spend), r.progress ? h("div", { class: "sub" }, "so far") : null, r.spend_unknown ? h("div", { class: "sub" }, "+ unknown") : null]),
+        h("td", { class: "num" }, runMenu(r)));
+    }));
+    empty.style.display = rows.length ? "none" : "";
+  }
+  search.addEventListener("input", () => { runsUi.q = search.value; draw(); });
+
+  card.append(
+    h("div", { class: "row spread" }, h("h3", { style: "margin:0" }, "All runs"), h("button", { class: "btn", onclick: () => go("new") }, "+ New Run")),
+    tiles,
+    serverStrip,
+    h("div", { class: "row spread", style: "flex-wrap:wrap;gap:10px;margin-bottom:6px" },
+      h("div", { class: "row", style: "gap:10px;flex-wrap:wrap" }, search, filterBox),
+      h("div", { class: "row", style: "gap:6px" }, h("span", { class: "muted", style: "font-size:12px" }, "Sort"), sortBox)),
+    h("div", { class: "table-scroll" }, h("table", { class: "runs-table" },
+      h("thead", {}, h("tr", {}, ...heads.map(([t, num]) => h("th", { scope: "col", class: num ? "num" : "" }, t)))), tbody)),
+    empty,
+    h("div", { class: "legend", style: "margin-top:10px" },
+      ...[["safe_drop_in"], ["drop_in_with_prompt_tuning"], ["needs_work"], ["not_a_drop_in"]].map(([b]) =>
+        h("span", {}, h("i", { class: "dot", style: `background:${BAND_COLOR[b]}` }), BAND_TEXT[b])),
+      h("span", {}, "ringed dot = recommended · red tick = quality gate")));
+  draw();
+
+  // While anything is running, refresh the list every 3 s (stops once you leave the page;
+  // waits while you're typing in search or have a row menu open, so nothing is lost).
+  if (live.length || runs.some(r => r.status === "ingesting")) {
+    const tick = () => {
+      if (!document.body.contains(card) || state.view !== "runs") return;
+      if (document.activeElement === search || card.querySelector("details.rowmenu[open]")) { setTimeout(tick, 3000); return; }
+      clear(main); renderRuns(main);
+    };
+    setTimeout(tick, 3000);
+  }
 }
 
 // New Run: Source -> Config wizard
@@ -173,9 +357,9 @@ function newRunSource(main, d) {
     },
   });
   const s3Input = h("input", { type: "text", placeholder: "s3://bucket/prefix" });
-  const fileInput = h("input", { type: "file", style: "display:none", onchange: e => uploadThenIngest(main, d, e.target.files[0]) });
+  const fileInput = h("input", { type: "file", accept: ".json,.jsonl,.ndjson,.log,.gz,.zip", style: "display:none", onchange: e => uploadThenIngest(main, d, e.target.files[0]) });
   const dz = h("div", { class: "dropzone", onclick: () => fileInput.click() },
-    "Drop a LiteLLM log file, or click to browse", fileInput);
+    "Drop a LiteLLM log file — or a .zip of log folders, consolidated into one run — or click to browse", fileInput);
   const preview = h("div", { id: "ingPreview" });
   main.append(h("div", { class: "card" },
     h("h3", {}, "1 · Source"),
@@ -246,7 +430,9 @@ async function uploadThenIngest(main, d, file) {
     await ensureRun(d);
     const fd = new FormData(); fd.append("file", file);
     const up = await api("/uploads", { method: "POST", body: fd });
-    status.textContent = "Parsing & normalizing log rows…";
+    status.textContent = /\.zip$/i.test(file.name)
+      ? "Expanding zip and normalizing every log file into one run…"
+      : "Parsing & normalizing log rows…";
     const ing = await api(`/runs/${d.runId}/ingest`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ upload_id: up.upload_id }) });
     d.ingestion = ing.ingestion; showIngestion(d);
   } catch (e) {
@@ -312,127 +498,223 @@ function showIngestion(d) {
   pv.append(h("div", { class: "card" }, seg));
 }
 
+// ---- Candidate picker (candidate-picker spec, Option A) ----------------------
+// Left: "Your candidates", each with its own reasoning efforts (each effort = one run).
+// Right: the endpoint's live model list, searchable, suggested first, providers grouped.
+const PICK_ENDPOINT_TEXT = { bedrock_runtime: "Bedrock Runtime", bedrock_mantle: "Bedrock Mantle", litellm: "LiteLLM proxy" };
+const AVAIL = {};   // endpoint -> /models/available response (per page load)
+
+function defaultEffortFor(info) {
+  const ok = (info && info.efforts) || [];
+  if (!info || info.effort_applies === false) return ok[0] || "medium";
+  const def = (MODELS && MODELS.default_reasoning_effort) || "medium";
+  return ok.includes(def) ? def : (ok.includes("medium") ? "medium" : (ok[0] || def));
+}
+
+function candidatePicker(d, legacy, onChange) {
+  const tray = h("div", { class: "pk-tray" });
+  const browse = h("div", { class: "pk-browse" });
+  const status = h("div", { class: "pk-live" });
+  const ui = { query: "", provider: "all", allProviders: false, list: null };
+  const info = (name) => ((ui.list && ui.list.models) || []).find(m => m.name === name);
+  const probing = new Set();
+  const probeErr = {};
+
+  const changed = () => { d.candidates = d.picks.map(p => p.model); drawTray(); drawBrowse(); onChange(); };
+
+  function addPick(name) {
+    if (d.picks.some(p => p.model === name)) return;
+    const m = info(name);
+    d.picks.push({ model: name, efforts: [defaultEffortFor(m)] });
+    if (m && m.effort_applies !== false && !m.efforts_checked) probe(name);
+    changed();
+  }
+  const removePick = (name) => { d.picks = d.picks.filter(p => p.model !== name); changed(); };
+
+  async function probe(name) {
+    probing.add(name); delete probeErr[name]; drawTray();
+    try {
+      const r = await api("/models/probe-efforts", { method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name }) });
+      const m = info(name);
+      if (m) { m.efforts = r.efforts; m.efforts_checked = !!r.efforts; }
+      if (!r.efforts) probeErr[name] = Object.values(r.errors || {})[0] || "no effort was accepted";
+      const p = d.picks.find(x => x.model === name);
+      if (p && r.efforts) {
+        p.efforts = p.efforts.filter(e => r.efforts.includes(e));
+        if (!p.efforts.length) p.efforts = [defaultEffortFor(m)];
+      }
+    } catch (e) { probeErr[name] = e && e.message ? e.message : "check failed"; }
+    probing.delete(name); changed();
+  }
+
+  function tags(m) {
+    if (!m) return [];
+    return [m.suggested ? h("span", { class: "pk-tag sug" }, "suggested") : null,
+      m.like_for_like ? h("span", { class: "pk-tag peer" }, "like-for-like") : null,
+      (m.catalog && m.provider !== "OpenAI") ? h("span", { class: "pk-tag" }, "cross-family") : null,
+      m.price ? null : h("span", { class: "pk-tag warn", title: "No list price configured: cost is left out of ranking" }, "no price")]
+      .filter(Boolean);
+  }
+  const priceText = (m) => m && m.price ? `$${m.price.input_per_1m.toFixed(2)} / $${m.price.output_per_1m.toFixed(2)} per 1M` : "no price";
+
+  function effortChips(p) {
+    const m = info(p.model);
+    if (m && m.effort_applies === false) {
+      return h("div", { class: "pk-eff" }, h("span", { class: "pk-chip on" }, "default"),
+        h("span", { class: "muted", style: "font-size:11px" }, "reasoning effort doesn't apply on this path"));
+    }
+    if (probing.has(p.model)) return h("div", { class: "pk-eff muted", style: "font-size:11px" }, "Checking which efforts this model accepts…");
+    const ok = (m && m.efforts) || null;
+    if (!ok) {
+      return h("div", { class: "pk-eff" },
+        h("span", { class: "pk-chip on" }, p.efforts[0] || "medium"),
+        h("span", { class: "muted", style: "font-size:11px" },
+          probeErr[p.model] ? `Couldn't check efforts (${probeErr[p.model].slice(0, 90)}). ` : "Efforts not checked yet. "),
+        h("button", { class: "linkbtn", onclick: () => probe(p.model) }, "Check efforts"));
+    }
+    return h("div", { class: "pk-eff", role: "group", "aria-label": `Reasoning efforts for ${p.model}` }, ...ok.map(e => {
+      const on = p.efforts.includes(e);
+      return h("button", { class: "pk-chip" + (on ? " on" : ""), "aria-pressed": on ? "true" : "false",
+        title: on ? `Remove ${p.model}@${e}` : `Also run ${p.model}@${e}`,
+        onclick: () => {
+          if (on && p.efforts.length === 1) return;       // keep at least one effort
+          p.efforts = on ? p.efforts.filter(x => x !== e) : ok.filter(x => x === e || p.efforts.includes(x));
+          changed();
+        } }, e);
+    }));
+  }
+
+  function drawTray() {
+    clear(tray);
+    const runs = d.picks.reduce((a, p) => a + p.efforts.length, 0);
+    tray.append(h("div", { class: "row spread", style: "margin-bottom:4px" },
+      h("b", {}, `Your candidates · ${d.picks.length} model${d.picks.length === 1 ? "" : "s"} → ${runs} run${runs === 1 ? "" : "s"}`),
+      h("span", { class: "muted", style: "font-size:11px" }, "click an effort to add or remove it")));
+    if (!d.picks.length) {
+      tray.append(h("div", { class: "muted", style: "padding:18px 6px" }, "No candidates yet. Add models from the list on the right."));
+      return;
+    }
+    d.picks.forEach(p => {
+      const m = info(p.model);
+      tray.append(h("div", { class: "pk-trow" },
+        h("div", {}, h("b", { class: "mono" }, p.model), " ", ...tags(m),
+          h("div", { class: "pk-meta" }, `${(m && m.provider) || "—"} · ${priceText(m)}`)),
+        h("button", { class: "pk-x", title: `Remove ${p.model}`, "aria-label": `Remove ${p.model}`, onclick: () => removePick(p.model) }, "×"),
+        h("div", { style: "grid-column:1/3" }, effortChips(p))));
+    });
+    tray.append(h("div", { class: "pk-runs mono" }, d.picks.flatMap(p => p.efforts.map(e =>
+      (info(p.model) || {}).effort_applies === false ? p.model : `${p.model}@${e}`)).join(" · ")));
+  }
+
+  function drawBrowse() {
+    clear(browse);
+    const list = (ui.list && ui.list.models) || [];
+    const q = ui.query.trim().toLowerCase();
+    const match = (m) => !q || [m.name, m.display, m.provider, m.model_id].some(x => (x || "").toLowerCase().includes(q));
+    const counts = {};
+    list.forEach(m => { counts[m.provider] = (counts[m.provider] || 0) + 1; });
+    const provs = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+    const shown = ui.allProviders ? provs : provs.slice(0, 4);
+    const search = h("input", { type: "search", class: "pk-search", placeholder: `Search ${list.length} models…`,
+      value: ui.query, "aria-label": "Search models",
+      oninput: (e) => { ui.query = e.target.value; const pos = e.target.selectionStart; drawBrowse();
+        const s = browse.querySelector(".pk-search"); s.focus(); s.setSelectionRange(pos, pos); } });
+    const chip = (key, label, n) => h("button", { class: "pk-chip" + (ui.provider === key ? " on" : ""),
+      onclick: () => { ui.provider = key; drawBrowse(); } }, label, h("span", { class: "n" }, ` ${n}`));
+    browse.append(search, h("div", { class: "pk-provs" }, chip("all", "All", list.length),
+      ...shown.map(([p, n]) => chip(p, p, n)),
+      provs.length > 4 ? h("button", { class: "pk-chip", onclick: () => { ui.allProviders = !ui.allProviders; drawBrowse(); } },
+        ui.allProviders ? "fewer" : `+${provs.length - 4} more`) : null));
+
+    const visible = list.filter(m => match(m) && (ui.provider === "all" || m.provider === ui.provider));
+    const row = (m) => {
+      const on = d.picks.some(p => p.model === m.name);
+      const r = h("div", { class: "pk-lrow", role: "button", tabindex: "0", "aria-pressed": on ? "true" : "false",
+        title: on ? "Remove from candidates" : "Add to candidates" },
+        h("span", { class: "pk-plus" + (on ? " done" : "") }, on ? "✓" : "+"),
+        h("div", { class: "grow" }, h("b", { class: "mono" }, m.name), " ", ...tags(m).filter(t => !t.classList.contains("sug")),
+          h("div", { class: "pk-meta" }, (m.catalog ? "built-in" : m.model_id)
+            + " · " + (m.price ? "priced" : "no price")
+            + (m.effort_applies === false ? " · effort n/a" : (m.efforts_checked ? " · efforts known" : " · efforts checked on add")))));
+      const toggle = () => (on ? removePick(m.name) : addPick(m.name));
+      r.addEventListener("click", toggle);
+      r.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggle(); } });
+      return r;
+    };
+    const body = h("div", { class: "pk-list" });
+    const sug = visible.filter(m => m.suggested);
+    if (sug.length) body.append(h("div", { class: "pk-group" }, h("span", {}, `Suggested for ${legacy || "your model"}`), h("span", {}, String(sug.length))), ...sug.map(row));
+    const rest = visible.filter(m => !m.suggested);
+    const groups = {};
+    rest.forEach(m => { (groups[m.provider] = groups[m.provider] || []).push(m); });
+    const order = Object.keys(groups).sort((a, b) => (groups[b].some(m => m.catalog) - groups[a].some(m => m.catalog)) || groups[b].length - groups[a].length);
+    order.forEach((p, i) => {
+      // Expanded: while searching, when filtered to one provider, or the first (built-in) group.
+      const open = !!q || ui.provider !== "all" || i === 0;
+      const det = h("details", { class: "pk-det" },
+        h("summary", { class: "pk-group" }, h("span", {}, p), h("span", {}, String(groups[p].length))), ...groups[p].map(row));
+      if (open) det.open = true;
+      body.append(det);
+    });
+    if (!visible.length) body.append(h("div", { class: "muted", style: "padding:12px 4px" },
+      list.length ? "No model matches your search." : "No models to show."));
+    browse.append(body);
+  }
+
+  async function load(refresh = false) {
+    const ep = d.endpoint || "bedrock_runtime";
+    clear(status); status.append(h("span", { class: "muted" }, `Listing models from ${PICK_ENDPOINT_TEXT[ep]}…`));
+    let res = (!refresh && AVAIL[ep]) || null;
+    if (!res) {
+      try { res = await api(`/models/available?endpoint=${encodeURIComponent(ep)}&legacy=${encodeURIComponent(legacy || "")}${refresh ? "&refresh=true" : ""}`); }
+      catch (e) { res = { models: [], reason: e && e.message ? e.message : "request failed", count: 0 }; }
+      if (!res.reason) AVAIL[ep] = res;
+    }
+    ui.list = res;
+    // Keep only picks this endpoint can run (e.g. switching to LiteLLM drops unserved models).
+    const names = new Set((res.models || []).map(m => m.name));
+    d.picks = d.picks.filter(p => names.has(p.model));
+    if (!d.picks.length && !d.pickedOnce) {
+      d.picks = (res.models || []).filter(m => m.suggested).map(m => ({ model: m.name, efforts: [defaultEffortFor(m)] }));
+    }
+    d.pickedOnce = true;
+    clear(status);
+    status.append(h("i", { class: res.reason ? "bad" : "" }),
+      res.reason ? `${PICK_ENDPOINT_TEXT[ep]}: ${res.reason}. Showing built-in models only. `
+        : `Listed live from ${PICK_ENDPOINT_TEXT[ep]}${res.region && ep !== "litellm" ? " · " + res.region : ""} · ${res.listed_count} models · `,
+      h("button", { class: "linkbtn", onclick: () => load(true) }, "refresh"));
+    changed();
+  }
+
+  return { tray, browse, status, load };
+}
+
 function newRunConfig(main, d) {
   const legacy = d.ingestion?.detected_models?.[0]?.model;
   const entry = (MODELS?.matrix || []).find(e => normModel(e.legacy_model) === normModel(legacy));
-  const allModels = Object.keys(MODELS?.models || {});
-  // Matrix candidates first (pre-selected), then every other catalog model
-  // (incl. Claude) as available extras for a cross-family comparison.
-  const primary = entry ? entry.candidates.slice() : allModels;
-  const extras = allModels.filter(m => !primary.includes(m));
-  const cands = [...primary, ...extras];
   const mapped = !!entry;
-  if (!d.candidates.length) {
-    d.candidates = entry ? entry.candidates.slice() : (allModels.length ? [allModels[0]] : []);
+  // Candidates + per-model efforts. Migrates state from the older global-effort form.
+  if (!Array.isArray(d.picks)) {
+    const effs = (Array.isArray(d.efforts) && d.efforts.length) ? d.efforts : [d.effort || "medium"];
+    d.picks = (d.candidates || []).map(m => ({ model: m, efforts: candidateEfforts(m, effs).length ? candidateEfforts(m, effs) : [effortsFor(m)[0]] }));
+    if (d.picks.length) d.pickedOnce = true;
   }
-  const cardsWrap = h("div", { class: "grid cols-3" });
-  cands.forEach(m => {
-    const fam = MODELS?.models?.[m]?.family;
-    const card = h("div", { class: "candcard" + (d.candidates.includes(m) ? " sel" : "") },
-      h("div", { class: "row spread" }, h("strong", {}, m),
-        h("span", {}, MODELS?.models?.[m]?.like_for_like ? h("span", { class: "badge" }, "peer") : null,
-          (fam && fam !== "openai") ? h("span", { class: "badge", style: "margin-left:4px" }, fam) : null)),
-      h("div", { class: "muted", style: "font-size:12px;margin-top:4px" },
-        m === entry?.default_start ? "recommended start"
-          : (fam && fam !== "openai" ? "cross-family baseline" : "candidate")));
-    card.addEventListener("click", () => {
-      const i = d.candidates.indexOf(m);
-      if (i >= 0) d.candidates.splice(i, 1); else d.candidates.push(m);
-      card.classList.toggle("sel");
-      updatePlan(d);
-    });
-    cardsWrap.append(card);
-  });
-
-  // --- Dynamic LiteLLM discovery: aliases the configured proxy actually serves.
-  // Shown only when the endpoint is LiteLLM. Discovered aliases NOT in the catalog
-  // are added to d.candidates as raw names (run through the proxy as-is; scored
-  // normally, cost skipped when un-priced). Catalog aliases are skipped (already above).
-  const discoveredWrap = h("div", { style: "margin-top:14px" });
-  async function loadDiscovered() {
-    clear(discoveredWrap);
-    const litellm = d.endpoint === "litellm";
-    // On the LiteLLM path the catalog (Bedrock) cards don't apply — hide them and
-    // let the proxy's discovered models BE the candidate list. Restore otherwise.
-    cardsWrap.style.display = litellm ? "none" : "";
-    const catHead = document.getElementById("catalogCandHeading");
-    if (catHead) catHead.style.display = litellm ? "none" : "";
-    if (!litellm) return;
-    const head = h("div", { class: "row spread", style: "margin-bottom:6px" },
-      h("div", { style: "font-weight:600" }, "Candidate models (from your LiteLLM proxy)"),
-      h("button", { class: "btn ghost", onclick: () => loadDiscovered() }, "↻ Refresh"));
-    const status = h("div", { class: "muted", style: "font-size:12px;margin-bottom:8px" }, "Querying proxy…");
-    discoveredWrap.append(head, status);
-    let res;
-    try { res = await api("/litellm/models"); }
-    catch (e) { status.textContent = "Could not query the proxy: " + (e && e.message ? e.message : "error"); return; }
-    const models = res.models || [];
-    if (!models.length) {
-      status.textContent = res.reason
-        ? `No models from ${res.base || "the proxy"} — ${res.reason}`
-        : `No models registered on ${res.base || "the proxy"}.`;
-      return;
-    }
-    // Drop any lingering catalog (Bedrock) selections that aren't served by the proxy,
-    // so the plan reflects only what's actually selectable on this path.
-    const served = new Set(models);
-    d.candidates = d.candidates.filter(m => served.has(m));
-    // Split: registered model-group aliases (what an admin configured) vs LiteLLM's
-    // automatic bedrock/* passthrough (often 100s) — show aliases as the primary
-    // picker, tuck the passthrough behind a toggle so it doesn't flood the screen.
-    const primary = models.filter(m => !m.startsWith("bedrock/"));
-    const passthrough = models.filter(m => m.startsWith("bedrock/"));
-    const primaryList = primary.length ? primary : models;  // if all are bedrock/, show them
-    status.textContent = `${primary.length} model group(s) from ${res.base}`
-      + (passthrough.length ? ` (+${passthrough.length} bedrock/* passthrough)` : "")
-      + ". Pick any to evaluate through the proxy (cost shown only if priced).";
-
-    function makeCard(alias) {
-      const card = h("div", { class: "candcard" + (d.candidates.includes(alias) ? " sel" : "") },
-        h("div", { class: "row spread" }, h("strong", {}, alias),
-          h("span", { class: "badge" }, "proxy")),
-        h("div", { class: "muted", style: "font-size:12px;margin-top:4px" }, "LiteLLM-discovered candidate"));
-      card.addEventListener("click", () => {
-        const i = d.candidates.indexOf(alias);
-        if (i >= 0) d.candidates.splice(i, 1); else d.candidates.push(alias);
-        card.classList.toggle("sel");
-        updatePlan(d);
-      });
-      return card;
-    }
-
-    const grid = h("div", { class: "grid cols-3" });
-    primaryList.forEach(a => grid.append(makeCard(a)));
-    discoveredWrap.append(grid);
-
-    // Collapsible bedrock/* passthrough (only when there ARE registered aliases,
-    // otherwise they're already shown above).
-    if (primary.length && passthrough.length) {
-      const moreGrid = h("div", { class: "grid cols-3", style: "margin-top:10px" });
-      passthrough.forEach(a => moreGrid.append(makeCard(a)));
-      discoveredWrap.append(h("details", { style: "margin-top:10px" },
-        h("summary", { style: "cursor:pointer;font-size:12px;color:var(--muted)" },
-          `Show all ${passthrough.length} bedrock/* passthrough models`),
-        moreGrid));
-    }
-  }
-
-  const effortSeg = h("div", { class: "seg" }, ...["minimal", "low", "medium", "high"].map(x =>
-    h("button", { class: x === d.effort ? "active" : "", onclick: e => { d.effort = x; effortSeg.querySelectorAll("button").forEach(b => b.classList.toggle("active", b.textContent === x)); updatePlan(d); } }, x)));
+  const picker = candidatePicker(d, legacy, () => updatePlan(d));
   const ENDPOINTS = [
-    ["bedrock_runtime", "Bedrock Runtime", "us.openai.* · /openai/v1 · Luna/Terra/Sol"],
-    ["bedrock_mantle", "Bedrock Mantle", "openai.* · /openai/v1 · required for GPT-5.4"],
+    ["bedrock_runtime", "Bedrock Runtime", "us.openai.* · /openai/v1 · Luna/Terra/Sol/GPT-5.4"],
+    ["bedrock_mantle", "Bedrock Mantle", "openai.* and other providers · /openai/v1 and /v1 · signed with your AWS credentials"],
     ["litellm", "LiteLLM proxy", "your proxy · /v1/chat/completions"],
   ];
-  // If a mantle-only model (GPT-5.4) is selected, force Mantle and lock the others.
+  // If a mantle-only model is selected, force Mantle and lock the others.
   const hasMantleOnly = d.candidates.some(m => MODELS?.models?.[m] && MODELS.models[m].runtime_supported === false);
   if (hasMantleOnly) d.endpoint = "bedrock_mantle";
   const pathSeg = h("div", { class: "seg" }, ...ENDPOINTS.map(([v, t, hint]) =>
     h("button", {
       class: v === d.endpoint ? "active" : "",
-      title: hasMantleOnly && v !== "bedrock_mantle" ? "Disabled — a mantle-only model (GPT-5.4) is selected" : hint,
+      title: hasMantleOnly && v !== "bedrock_mantle" ? "Disabled — a mantle-only model is selected" : hint,
       disabled: hasMantleOnly && v !== "bedrock_mantle",
-      onclick: () => { d.endpoint = v; pathSeg.querySelectorAll("button").forEach((b) => b.classList.toggle("active", b.textContent === t)); loadDiscovered(); updatePlan(d); },
+      onclick: () => { d.endpoint = v; pathSeg.querySelectorAll("button").forEach((b) => b.classList.toggle("active", b.textContent === t)); picker.load(); updatePlan(d); },
     }, t)));
   const mantleModels = d.candidates.filter(m => MODELS?.models?.[m] && MODELS.models[m].runtime_supported === false);
   const endpointHint = h("div", { class: "muted", style: "font-size:11px;margin-top:4px" },
@@ -525,14 +807,14 @@ function newRunConfig(main, d) {
 
   main.append(h("div", { class: "card" },
     h("h3", {}, "2 · Configuration"),
-    h("div", { id: "catalogCandHeading", class: "muted", style: "margin-bottom:8px" }, "Candidate models" + (
-      mapped ? ` (pre-filled from matrix for ${legacy})`
-             : ` — “${legacy || "unknown"}” isn’t in the migration matrix; pick any candidate to evaluate against`)),
-    cardsWrap,
-    discoveredWrap,
-    h("div", { class: "grid cols-2", style: "margin-top:18px" },
-      h("label", { class: "field" }, h("span", {}, "Reasoning effort (start at medium to baseline)"), effortSeg),
-      h("label", { class: "field" }, h("span", {}, "Endpoint"), pathSeg, endpointHint)),
+    h("div", { class: "row spread", style: "align-items:flex-end;gap:14px;flex-wrap:wrap" },
+      h("label", { class: "field", style: "margin:0" }, h("span", {}, "Call models through"), pathSeg, endpointHint),
+      picker.status),
+    h("div", { class: "muted", style: "margin:12px 0 8px" }, "Candidate models" + (
+      mapped ? ` (suggested for ${legacy} are pre-selected)`
+             : ` — “${legacy || "unknown"}” isn’t in the migration matrix; add any models to compare`)),
+    h("div", { class: "pk-grid" }, picker.tray, picker.browse),
+    replayField(d),
     targetingField,
     limitField,
     steeringField,
@@ -543,30 +825,102 @@ function newRunConfig(main, d) {
         h("button", { class: "btn secondary", onclick: () => launch(d, true) }, "Dry run (no spend)"),
         h("button", { class: "btn", onclick: () => launch(d, false) }, "Review & launch")))));
   updatePlan(d);
-  loadDiscovered();
+  picker.load();
+}
+
+// Which of the selected efforts each model actually runs. Unsupported ones are skipped (Bedrock
+// would reject every call with a 400); a model whose call path ignores effort (Claude) runs once.
+function candidateEfforts(model, selected) {
+  const ok = effortsFor(model);
+  if (!effortApplies(model)) return [ok[0]];
+  const keep = selected.filter(e => ok.includes(e));
+  return keep.length ? keep : [];
+}
+
+function effortSkipNote(models, selected) {
+  const notes = [];
+  (models || []).forEach(m => {
+    const ok = effortsFor(m);
+    if (!effortApplies(m)) {
+      if (selected.length > 1 || selected[0] !== ok[0]) notes.push(`${m}: reasoning effort isn't applied on this model, so it runs once`);
+      return;
+    }
+    const skipped = selected.filter(e => !ok.includes(e));
+    if (skipped.length === selected.length) notes.push(`${m}: none of the selected efforts are supported — it will not run (supports ${ok.join(", ")})`);
+    else if (skipped.length) notes.push(`${m}: skipping ${skipped.join(", ")} (supports ${ok.join(", ")})`);
+  });
+  return notes.join(" · ");
 }
 
 async function updatePlan(d) {
   const box = $("#planBox"); if (!box) return;
-  if (!d.candidates.length) { box.textContent = "select a candidate"; return; }
+  if (!(d.picks || []).length) { box.textContent = "add a candidate"; return; }
   try {
     const plan = await api(`/runs/${d.runId}/plan`, { method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify(cfgBody(d)) });
-    box.textContent = `${money(plan.est_cost)} · ${plan.estimated_calls} calls`;
+    if ((plan.replays || 1) > 1) {
+      box.replaceChildren(
+        `${plan.calls_without_replays} → ${plan.estimated_calls} calls · est ${money(plan.est_cost_without_replays)} → ${money(plan.est_cost)}`,
+        h("span", { class: "muted" }, ` (${plan.requests} request${plan.requests === 1 ? "" : "s"} × ${plan.per_candidate.length} candidate${plan.per_candidate.length === 1 ? "" : "s"} × ${plan.replays} replays)`));
+    } else {
+      box.textContent = `${money(plan.est_cost)} · ${plan.estimated_calls} calls`;
+    }
+    if (plan.est_seconds != null) {
+      const n = plan.parallelism || 1;
+      box.append(` · ~${fmtDur(plan.est_seconds)} at ${n === 1 ? "one call at a time" : `${n} parallel calls`} `,
+        h("a", { href: "?view=settings", class: "muted", style: "font-size:11px",
+          title: "Parallel calls are set in Settings → Run defaults",
+          onclick: (e) => { e.preventDefault(); go("settings"); } }, "(change in Settings)"));
+    }
+    const warn = document.getElementById("replayWarn");
+    if (warn) {
+      warn.style.display = plan.over_ceiling ? "" : "none";
+      warn.textContent = plan.over_ceiling
+        ? `${plan.estimated_calls} calls is above the ${plan.call_ceiling}-call limit set in Settings. Consider fewer replays, or sample fewer requests (Limit, above).`
+        : "";
+    }
   } catch (e) { box.textContent = e.message; }
+}
+
+// Configuration step: replay each request N times to measure consistency (D7).
+function replayField(d) {
+  if (d.replaysOn === undefined) d.replaysOn = false;
+  const def = (SETTINGS && SETTINGS.recommendation && SETTINGS.recommendation.default_replays) || 3;
+  d.replayN = d.replayN || def;
+  const nSeg = h("div", { class: "seg", role: "group", "aria-label": "Times to send each request" }, ...[2, 3, 4, 5].map(n =>
+    h("button", { class: n === d.replayN ? "active" : "", "aria-pressed": n === d.replayN ? "true" : "false",
+      onclick: () => {
+        d.replayN = n;
+        nSeg.querySelectorAll("button").forEach(b => { const on = Number(b.textContent) === n; b.classList.toggle("active", on); b.setAttribute("aria-pressed", on ? "true" : "false"); });
+        updatePlan(d);
+      } }, String(n))));
+  const nWrap = h("div", { class: "row", style: `gap:8px;${d.replaysOn ? "" : "display:none"}` },
+    h("span", { class: "muted", style: "font-size:12px" }, "Send each request"), nSeg, h("span", { class: "muted", style: "font-size:12px" }, "times"));
+  const toggle = h("input", { type: "checkbox", id: "replayToggle", "aria-describedby": "replayHelp" });
+  toggle.checked = !!d.replaysOn;
+  toggle.addEventListener("change", () => { d.replaysOn = toggle.checked; nWrap.style.display = d.replaysOn ? "" : "none"; updatePlan(d); });
+  return h("div", { class: "field", style: "margin-top:4px" },
+    h("div", { class: "row", style: "gap:16px;flex-wrap:wrap;align-items:center" },
+      h("label", { class: "row", style: "gap:8px;cursor:pointer", for: "replayToggle" }, toggle, h("b", { style: "font-size:13px" }, "Replay requests")),
+      nWrap),
+    h("div", { id: "replayHelp", class: "muted", style: "font-size:11px;margin-top:4px" },
+      "Sends the same request several times to see whether the model answers consistently. Every answer is scored normally; "
+      + "a separate D7 Consistency score compares the answers. Multiplies calls and cost."),
+    h("div", { id: "replayWarn", class: "banner warn", style: "display:none;margin-top:6px;font-size:12px" }));
 }
 
 function cfgBody(d) {
   const callPath = d.endpoint === "litellm" ? "litellm" : "bedrock";
   const bedrockEndpoint = d.endpoint === "bedrock_mantle" ? "mantle" : "runtime";
-  return { candidates: d.candidates.map(m => ({ model: m, reasoning_effort: d.effort })),
+  return { candidates: (d.picks || []).flatMap(p => p.efforts.map(e => ({ model: p.model, reasoning_effort: e }))),
            name: d.name || null,
            call_path: callPath, bedrock_endpoint: bedrockEndpoint,
            sampling_mode: d.samplingMode || "all",
            sampling_n: d.samplingN || 200,
            judge_steering: d.judgeSteering || null,
            filter_teams: (d.filterTeams && d.filterTeams.length) ? d.filterTeams : null,
-           filter_users: (d.filterUsers && d.filterUsers.length) ? d.filterUsers : null };
+           filter_users: (d.filterUsers && d.filterUsers.length) ? d.filterUsers : null,
+           replays: d.replaysOn ? (d.replayN || 3) : 1 };
 }
 
 async function launch(d, dry) {
@@ -630,24 +984,417 @@ function errorDetailPanel(res) {
   return wrap;
 }
 
+// ---- Run progress: stages, headline numbers, one row per candidate; a row expands to
+// that candidate's call matrix (one square per request, click a square for its details).
+const fmtDur = (sec) => {
+  if (sec == null || !isFinite(sec)) return "—";
+  sec = Math.max(0, Math.round(sec));
+  if (sec < 60) return `${sec}s`;
+  if (sec < 3600) return `${Math.floor(sec / 60)}m ${String(sec % 60).padStart(2, "0")}s`;
+  return `${Math.floor(sec / 3600)}h ${String(Math.floor(sec % 3600 / 60)).padStart(2, "0")}m`;
+};
+const fmtLat = (ms) => (ms == null ? "—" : ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(1)} s`);
+const fmtTok = (n) => (n == null ? "—" : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n));
+const fmtUsd = (n) => (n == null ? "—" : `$${n.toFixed(n < 1 ? 4 : 2)}`);
+const pctl = (arr, p) => {
+  if (!arr.length) return null;
+  const s = [...arr].sort((a, b) => a - b);
+  return s[Math.min(s.length - 1, Math.max(0, Math.ceil(p * s.length) - 1))];
+};
+const mean = (arr) => (arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null);
+// How each call is drawn: [matrix square class, plain-words label].
+const CELL = {
+  ok: ["ok", "ok"], rt: ["rt", "ok after retry"], ca: ["ca", "from cache"],
+  er: ["er", "failed"], rn: ["rn", "in flight"], bo: ["bo", "backing off"], pend: ["", "pending"],
+};
+const cellKind = (cell) => !cell ? "pend" : cell.status === "error" ? "er"
+  : cell.from_cache ? "ca" : (cell.attempts || 1) > 1 ? "rt" : "ok";
+const retryWhy = (r) => (r === "throttled" ? "a throttle" : r === "timeout" ? "a timeout" : r === "error" ? "an error" : r || "an error");
+
 function renderProgress(el, runId) {
   clear(el);
+  const S = {
+    planTs: null, lastTs: null, lastLocal: 0, total: 0, done: 0, estCost: null, stage: "plan",
+    cands: new Map(), retries: 0, errors: 0, cache: 0, spend: 0, spendUnknown: false,
+    doneTs: [], open: new Set(), sel: null,
+    // Parallel calls: every in-flight call, the limit, per-endpoint effective limits, throttles.
+    inflight: new Map(), par: 1, eff: {}, waiting: false,
+    throttles: 0, throttleRetries: 0, throttleFails: 0, thrByEp: {}, thrLast: {}, thrCands: {},
+    series: [], thrTimes: [], changes: [],
+  };
+  const cand = (label) => {
+    let c = S.cands.get(label);
+    if (!c) {
+      c = { label, calls: 0, est: null, priceKnown: true, cells: [], done: 0, ok: 0, failed: 0,
+            cache: 0, retried: 0, lat: [], cost: 0, costUnknown: false, outTok: 0, throttles: 0 };
+      S.cands.set(label, c);
+    }
+    return c;
+  };
+  // With replays, a candidate's calls are laid out request by request, N replays each:
+  // position = request index × N + replay.
+  const R = () => S.replays || 1;
+  const posOf = (index, replay) => index * R() + (replay || 0);
+  const fkey = (model, index, replay) => `${model}|${index}|${replay || 0}`;
+  const flightAt = (c, i) => S.inflight.get(fkey(c.label, Math.floor(i / R()), i % R()));
+  const inflightOf = (c) => [...S.inflight.values()].filter(f => f.model === c.label);
+  const isNow = (c, i) => (i === undefined ? inflightOf(c).length > 0 : !!flightAt(c, i));
+  const effMin = () => { const v = Object.values(S.eff); return v.length ? Math.min(S.par, ...v) : S.par; };
+  const slowed = () => effMin() < S.par;
+  const backingOff = (f) => !!f && f.backoffUntil != null && serverNow() != null && serverNow() < f.backoffUntil;
+  const EP_TEXT = { "bedrock-runtime": "Bedrock runtime", "bedrock-mantle": "Bedrock Mantle",
+                    "bedrock-converse": "Bedrock Converse", litellm: "LiteLLM proxy", default: "Model endpoint" };
+  const epText = (ep) => EP_TEXT[ep] || ep;
+
+  // --- static frame
   const log = h("div", { class: "logpane", id: "runLog" });
-  const errChip = h("span", { class: "pill incompatible", style: "display:none" }, "0 errors");
-  const errToggle = h("label", { class: "row", style: "gap:6px;font-size:12px;cursor:pointer" });
+  const errChip = h("span", { class: "rp-st err", style: "display:none" });
+  const retryChip = h("span", { class: "rp-st warn", style: "display:none" });
   const errOnly = h("input", { type: "checkbox" });
-  errToggle.append(errOnly, h("span", { class: "muted" }, "errors only"));
   errOnly.addEventListener("change", () => log.classList.toggle("errors-only", errOnly.checked));
+  const logWrap = h("div", { style: "display:none;margin-top:14px" },
+    h("div", { class: "row spread", style: "margin-bottom:4px" },
+      h("span", { class: "muted", style: "font-size:11px" }, "Live log"),
+      h("label", { class: "row", style: "gap:6px;font-size:12px;cursor:pointer" }, errOnly,
+        h("span", { class: "muted" }, "errors only"))),
+    log);
+  const logBtn = h("button", { class: "btn ghost", "aria-expanded": "false",
+    onclick: () => {
+      const show = logWrap.style.display === "none";
+      logWrap.style.display = show ? "" : "none";
+      logBtn.textContent = show ? "Hide log" : "Show log";
+      logBtn.setAttribute("aria-expanded", show ? "true" : "false");
+      if (show) log.scrollTop = log.scrollHeight;
+    } }, "Show log");
+  const stepsEl = h("div", { class: "rp-steps" });
+  const kpiEl = h("div", { class: "rp-kpis" });
+  const tableEl = h("div", { style: "overflow-x:auto" });
+  const nowEl = h("div", { class: "rp-now", "aria-live": "polite" }, "Connecting to run…");
+  const thrChip = h("span", { class: "rp-st warn", style: "display:none" });
+  const bannerEl = h("div", { class: "banner warn", role: "status", style: "display:none;margin:10px 0" });
+  const timelineEl = h("div", { class: "rp-timeline" });
+  const flightEl = h("div", {});
+  const epEl = h("div", {});
+  const sideEl = h("div", { class: "rp-side" }, flightEl, epEl);
   el.append(
     h("div", { class: "row spread" },
-      h("div", { class: "row", style: "gap:10px;align-items:center" }, h("h3", { style: "margin:0" }, "Running"), errChip),
-      h("div", { class: "row", style: "gap:12px;align-items:center" }, errToggle,
+      h("div", { class: "row", style: "gap:10px;align-items:center" },
+        h("h3", { style: "margin:0" }, "Running"), thrChip, errChip, retryChip),
+      h("div", { class: "row", style: "gap:8px;align-items:center" }, logBtn,
         h("button", { class: "btn ghost", onclick: () => cancelRun(runId) }, "Cancel"))),
-    h("div", { class: "muted", id: "progText" }, "Connecting to run…"),
-    h("div", { class: "progress", style: "margin:10px 0" }, h("span", { id: "progBar", style: "width:0%" })),
-    h("div", { class: "muted", style: "font-size:11px;margin-bottom:4px" }, "Live log"),
-    log);
-  let errCount = 0;
+    bannerEl, stepsEl, timelineEl, kpiEl, tableEl, sideEl, nowEl,
+    h("div", { class: "muted", style: "font-size:11px;margin-top:8px" },
+      "Click a candidate to see each of its calls. Latency counts the successful attempt only; cached calls are excluded. Cost uses public list prices and assumes no prompt caching."),
+    logWrap);
+
+  // Server-clock "now": last event timestamp plus local time passed since it arrived.
+  const serverNow = () => (S.lastTs == null ? null : S.lastTs + (Date.now() - S.lastLocal) / 1000);
+
+  const renderSteps = () => {
+    const pct = S.total ? Math.round(100 * S.done / S.total) : 0;
+    const order = ["plan", "replay", "aggregate", "done"];
+    const state = (key) => {
+      const i = order.indexOf(key), cur = order.indexOf(S.stage);
+      return i < cur ? "done" : i === cur ? "cur" : "pend";
+    };
+    const step = (key, title, sub) => {
+      const s = h("div", { class: `rp-step ${state(key)}` }, h("b", {}, title), h("span", { class: "tnum" }, sub));
+      if (key === "replay" && state(key) === "cur") s.style.setProperty("--pct", `${pct}%`);
+      return s;
+    };
+    stepsEl.replaceChildren(
+      step("plan", "Plan", S.planTs ? `${S.total} calls · est ${fmtUsd(S.estCost)}` : "preparing…"),
+      step("replay", "Replay + score", `${S.done} / ${S.total || "?"} calls (${pct}%)`
+        + (R() > 1 && S.stage === "replay" ? ` · pass ${(S.pass || 0) + 1} of ${R()}` : "")),
+      step("aggregate", "Aggregate", "verdicts & recommendation"),
+      step("done", "Done", "results open automatically"));
+  };
+
+  const pace = () => {  // calls per second over the last 20 completions
+    const t = S.doneTs.slice(-20);
+    if (t.length < 2 || t[t.length - 1] <= t[0]) return null;
+    return (t.length - 1) / (t[t.length - 1] - t[0]);
+  };
+
+  const renderKpis = () => {
+    const now = serverNow();
+    const elapsed = S.planTs != null && now != null ? now - S.planTs : null;
+    const rate = pace();
+    const left = S.stage === "aggregate" ? "finishing…"
+      : rate && S.total ? `~${fmtDur((S.total - S.done) / rate)}` : "—";
+    const kpi = (l, v, s, amber) => h("div", { class: "rp-kpi" + (amber ? " amber" : "") }, h("div", { class: "l" }, l),
+      h("div", { class: "v" }, ...v), h("div", { class: "s" }, s));
+    const live = S.stage === "replay";
+    const nIn = S.inflight.size, remaining = S.total ? S.total - S.done : null;
+    const parSub = !live ? `limit ${S.par}` : S.waiting && !nIn ? "waiting for capacity"
+      : slowed() ? "slowed by throttling" : S.par === 1 ? "one call at a time"
+      : (remaining != null && nIn >= remaining) ? "last calls finishing"
+      : nIn >= effMin() ? "at the configured limit" : "below the limit";
+    kpiEl.replaceChildren(
+      kpi("Calls", [String(S.done), h("small", {}, ` / ${S.total || "?"}`)], `${S.done - S.errors} ok · ${S.errors} failed`),
+      kpi("Parallel calls", [String(live ? S.inflight.size : 0), h("small", {}, ` of ${live ? effMin() : S.par}`)],
+        slowed() && live ? `${parSub} (set to ${S.par})` : parSub, live && (slowed() || S.waiting)),
+      kpi("Throttles", [String(S.throttles)],
+        S.throttles ? `${S.throttleRetries} retried · ${S.throttleFails} failed` : "none so far", S.throttles > 0),
+      kpi("Elapsed", [fmtDur(elapsed)], S.planTs ? `started ${new Date(S.planTs * 1000).toLocaleTimeString()}` : ""),
+      kpi("Time left", [left], !rate ? "needs a few calls first" : slowed() && live ? "(slowed by throttling)" : "at current pace",
+        slowed() && live),
+      kpi("Pace", [rate ? String(Math.round(rate * 60)) : "—", h("small", {}, " /min")], "last 20 calls"),
+      kpi("Spend so far", [fmtUsd(S.spend)],
+        (S.estCost != null ? `of ~${fmtUsd(S.estCost)} estimated` : "") + (S.spendUnknown ? " · some prices unknown" : "")),
+      kpi("Cache hits", [String(S.cache)], "reused, not re-billed"),
+      kpi("Retries", [String(S.retries)], "throttles and transient errors"));
+  };
+
+  // Concurrency timeline: calls in flight (area), current limit (step line), configured limit
+  // (dashed), throttles (red ticks), slow-downs / recoveries (triangles).
+  const renderTimeline = () => {
+    const pts = S.series;
+    if (!S.planTs || pts.length < 2) { timelineEl.replaceChildren(); return; }
+    const W = 1000, H = 80, L = 34, Rr = W - 6, T = 12, B = H - 16;
+    const tMax = Math.max(pts[pts.length - 1].t, 1), yMax = Math.max(S.par, 1);
+    const X = (t) => L + (t / tMax) * (Rr - L), Y = (v) => B - (v / yMax) * (B - T);
+    const s = sv("svg", { viewBox: `0 0 ${W} ${H}`, width: "100%", height: String(H), role: "img",
+      "aria-label": `Parallel calls over time. Limit ${S.par}. ${S.throttles} throttles.`
+        + (S.changes.length ? ` ${S.changes.filter(c => c.reason === "throttle").length} slow-downs.` : "") });
+    const kids = [sv("text", { x: 0, y: 10, fill: "var(--muted)", "font-size": 10 }, "Parallel calls")];
+    for (let v = 1; v <= yMax; v++) {
+      if (yMax > 6 && v % Math.ceil(yMax / 4)) continue;
+      kids.push(sv("line", { x1: L, x2: Rr, y1: Y(v), y2: Y(v), stroke: "var(--border)", "stroke-width": 0.5 }),
+        sv("text", { x: L - 6, y: Y(v) + 3, "text-anchor": "end", fill: "var(--muted)", "font-size": 9 }, String(v)));
+    }
+    kids.push(sv("path", { d: `M${X(pts[0].t)},${B} ` + pts.map(p => `L${X(p.t)},${Y(p.inflight)}`).join(" ") + ` L${X(pts[pts.length - 1].t)},${B} Z`,
+      fill: "rgba(79,124,255,.25)", stroke: "var(--accent)", "stroke-width": 1 }));
+    kids.push(sv("path", { d: pts.map((p, i) => `${i ? "L" : "M"}${X(p.t)},${Y(p.eff)}${i < pts.length - 1 ? ` L${X(pts[i + 1].t)},${Y(p.eff)}` : ""}`).join(" "),
+      fill: "none", stroke: "var(--partial)", "stroke-width": 2 }));
+    kids.push(sv("line", { x1: L, x2: Rr, y1: Y(S.par), y2: Y(S.par), stroke: "var(--muted)", "stroke-dasharray": "4 4" }));
+    S.thrTimes.forEach(t => kids.push(sv("line", { x1: X(t), x2: X(t), y1: B, y2: B - 8, stroke: "var(--bad)", "stroke-width": 2 })));
+    S.changes.forEach(c => {
+      const col = c.reason === "throttle" ? "var(--partial)" : "var(--ok)";
+      const tri = sv("path", { d: `M${X(c.t) - 4},${T - 4} L${X(c.t) + 4},${T - 4} L${X(c.t)},${T + 2} Z`, fill: col });
+      tri.append(sv("title", {}, `${fmtDur(c.t)}: ${c.reason === "throttle" ? "slowed" : "recovered"} to ${c.eff}`));
+      kids.push(tri);
+    });
+    kids.push(sv("text", { x: L, y: H - 2, fill: "var(--muted)", "font-size": 9 }, "0:00"),
+      sv("text", { x: Rr, y: H - 2, "text-anchor": "end", fill: "var(--muted)", "font-size": 9 },
+        `${fmtDur(tMax)} · area = in flight · amber = current limit · dashed = your setting (${S.par}) · red = throttles`));
+    s.append(...kids.filter(Boolean));
+    timelineEl.replaceChildren(s);
+  };
+
+  const renderFlight = () => {
+    const live = S.stage === "replay";
+    const rows = [...S.inflight.values()].sort((a, b) => a.ts - b.ts);
+    const now = serverNow();
+    const lim = effMin();
+    const head = h("h4", { class: "rp-h4" }, live ? `In flight (${rows.length} of ${lim})` : "In flight");
+    if (!rows.length) {
+      flightEl.replaceChildren(head, h("div", { class: "muted", style: "font-size:12px" },
+        !live ? "—" : S.waiting ? "Waiting for capacity: other runs are using the server-wide limit." : "No call in flight right now."));
+    } else {
+      const tr = rows.slice(0, 8).map(f => {
+        const bo = backingOff(f);
+        const what = bo ? `retrying after ${retryWhy(f.reason)} · attempt ${f.attempt} of ${f.max} · next try in ${Math.max(0, Math.ceil(f.backoffUntil - now))} s`
+          : f.attempt > 1 ? `attempt ${f.attempt}${f.max ? ` of ${f.max}` : ""}` : "attempt 1";
+        return h("tr", { class: bo ? "boff" : "" },
+          h("td", { class: "mono" }, f.model),
+          h("td", { class: "mono" }, f.sample_id + (R() > 1 ? ` · replay ${(f.replay || 0) + 1}` : "")),
+          h("td", {}, what),
+          h("td", { class: "num tnum" }, fmtDur(now != null ? now - f.ts : 0)));
+      });
+      // Native replaceChildren prints null as the text "null", so drop the optional child first.
+      flightEl.replaceChildren(...[head, h("table", { class: "rp-flight" }, h("tbody", {}, ...tr)),
+        rows.length > 8 ? h("div", { class: "muted", style: "font-size:11px" }, `+${rows.length - 8} more`) : null]
+        .filter(Boolean));
+    }
+    // Throttling by endpoint: only once Bedrock (or the proxy) has pushed back.
+    const eps = [...new Set([...Object.keys(S.thrByEp), ...Object.keys(S.eff)])];
+    if (!S.throttles || !eps.length) { epEl.replaceChildren(); return; }
+    const ago = (t) => (t == null || now == null ? "—" : `${fmtDur(now - t)} ago`);
+    epEl.replaceChildren(h("h4", { class: "rp-h4" }, "Throttling by endpoint"),
+      h("table", { class: "rp-flight" },
+        h("thead", {}, h("tr", {}, h("th", {}, "Endpoint"), h("th", { class: "num" }, "Limit"),
+          h("th", { class: "num" }, "Throttles"), h("th", {}, "Last"))),
+        h("tbody", {}, ...eps.map(ep => {
+          const e = S.eff[ep] ?? S.par;
+          return h("tr", {},
+            h("td", {}, epText(ep), " ", h("span", { class: "muted" }, `(${[...(S.thrCands[ep] || [])].join(", ") || "—"})`)),
+            h("td", { class: "num tnum", style: e < S.par ? "color:var(--partial)" : "" }, `${e} / ${S.par}`),
+            h("td", { class: "num tnum" }, String(S.thrByEp[ep] || 0)),
+            h("td", {}, ago(S.thrLast[ep])));
+        }))));
+  };
+
+  const renderBanner = () => {
+    const live = S.stage === "replay";
+    if (live && slowed()) {
+      const eps = Object.entries(S.eff).filter(([, v]) => v < S.par).map(([k]) => epText(k));
+      bannerEl.replaceChildren("⚠ Running slower than configured: ", h("b", {}, `${eps.join(", ") || "Bedrock"} is throttling`),
+        `, so ModelShift is sending ${effMin()} call${effMin() === 1 ? "" : "s"} at a time instead of ${S.par}. Calls are retried automatically; no answers are lost.`);
+      bannerEl.style.display = "";
+    } else bannerEl.style.display = "none";
+  };
+
+  const sample = () => {   // one timeline point per event (deduped), ≤ 600 points
+    if (!S.planTs || S.lastTs == null) return;
+    const p = { t: Math.max(0, S.lastTs - S.planTs), inflight: S.inflight.size, eff: effMin() };
+    const last = S.series[S.series.length - 1];
+    if (last && last.inflight === p.inflight && last.eff === p.eff) return;
+    S.series.push(p);
+    if (S.series.length > 600) S.series = S.series.filter((_, i) => i % 2 === 0 || i === S.series.length - 1);
+  };
+
+  const candStatus = (c) => {
+    const k = inflightOf(c).length;
+    if (k) return h("span", { class: "rp-st run" }, h("span", { class: "rp-dot rp-pulse" }),
+      S.par > 1 ? `Running · ${k} in flight` : "Running");
+    if (c.calls && c.done >= c.calls) return c.failed
+      ? h("span", { class: "rp-st warn" }, `✓ Complete · ${c.failed} failed`)
+      : h("span", { class: "rp-st done" }, "✓ Complete");
+    return h("span", { class: "rp-st pend" }, c.done ? (S.stage === "replay" ? "Queued" : "Paused") : "Pending");
+  };
+
+  const laneBar = (c) => {
+    const n = Math.max(c.calls, c.done, 1);
+    const fl = inflightOf(c), boN = fl.filter(backingOff).length;
+    const seg = (cls, k, label) => (k ? h("span", { class: cls, style: `width:${100 * k / n}%`, title: `${k} ${label}` }) : null);
+    return h("div", { class: "rp-bar", role: "img",
+      "aria-label": `${c.done} of ${c.calls} calls done: ${c.ok} ok, ${c.cache} from cache, ${c.failed} failed, ${fl.length} in flight` },
+      seg("rp-ok", c.ok - c.cache - c.retried, "ok"), seg("rp-rt", c.retried, "ok after retry"),
+      seg("rp-ca", c.cache, "from cache"), seg("rp-er", c.failed, "failed"),
+      seg("rp-rn rp-pulse", fl.length - boN, "in flight"), seg("rp-bo rp-pulse", boN, "backing off"));
+  };
+
+  const cellDetail = (c, i) => {
+    const cell = c.cells[i];
+    const item = (l, v) => h("div", {}, h("span", { class: "l" }, l), v);
+    const box = h("div", { class: "rp-detail" });
+    const repItem = R() > 1 ? item("Replay", `${(i % R()) + 1} of ${R()}`) : null;
+    const fl = flightAt(c, i);
+    if (fl) {
+      const bo = backingOff(fl);
+      box.append(item("Call", h("span", { class: "mono" }, `${c.label} · ${fl.sample_id}`)),
+        ...(repItem ? [repItem] : []),
+        item("Status", h("span", { style: `color:var(--${bo ? "partial" : "accent"})` }, bo ? "backing off" : "in flight")),
+        item("Attempt", fl.max ? `${fl.attempt} of ${fl.max}` : String(fl.attempt)),
+        item("So far", fmtDur(serverNow() - fl.ts)));
+      if (fl.reason) box.append(h("div", { class: "err" }, `Retrying after ${retryWhy(fl.reason)}: ${fl.error || ""}`));
+      return box;
+    }
+    if (!cell) {
+      box.append(item("Call", h("span", { class: "mono" }, `${c.label} · request ${Math.floor(i / R()) + 1}`)),
+        ...(repItem ? [repItem] : []), item("Status", "not started yet"));
+      return box;
+    }
+    const k = cellKind(cell);
+    const colour = { er: "bad", ca: "drift", rt: "partial", ok: "ok" }[k];
+    box.append(
+      item("Call", h("span", { class: "mono" }, `${c.label} · ${cell.sample_id}`)),
+      ...(repItem ? [repItem] : []),
+      item("Status", h("span", { style: `color:var(--${colour})` }, CELL[k][1])),
+      item("Attempts", String(cell.attempts || 1)),
+      item(cell.status === "error" ? "Failed after" : "Latency", cell.from_cache ? "cached" : fmtLat(cell.latency_ms)),
+      item("Tokens in / out", `${fmtTok(cell.input_tokens)} / ${fmtTok(cell.output_tokens)}`),
+      item("Reasoning tokens", fmtTok(cell.reasoning_tokens)),
+      item("Cost", cell.cost != null ? fmtUsd(cell.cost) : cell.status === "error" ? "$0" : "unknown"));
+    if (cell.error) box.append(h("div", { class: "err" }, cell.error));
+    return box;
+  };
+
+  const matrix = (c) => {
+    const n = Math.max(c.calls, c.done);
+    const cells = h("div", { class: "rp-cells" + (R() > 1 ? " grouped" : ""), role: "group", "aria-label": `Calls for ${c.label}` });
+    let grp = null;
+    for (let i = 0; i < n; i++) {
+      const cell = c.cells[i];
+      const fl = flightAt(c, i);
+      const k = fl ? (backingOff(fl) ? "bo" : "rn") : cellKind(cell);
+      const sel = !!S.sel && S.sel.label === c.label && S.sel.index === i;
+      const rep = R() > 1 ? ` (replay ${(i % R()) + 1} of ${R()})` : "";
+      const label = `${cell ? cell.sample_id : fl ? fl.sample_id : `request ${Math.floor(i / R()) + 1}`}${rep}: ${CELL[k][1]}` +
+        (cell && cell.latency_ms != null && !cell.from_cache ? `, ${fmtLat(cell.latency_ms)}` : "");
+      const btn = h("button", { class: `rp-c ${CELL[k][0]}${sel ? " sel" : ""}`, title: label, "aria-label": label,
+        "aria-pressed": sel ? "true" : "false", "data-cell": `${c.label}|${i}`,
+        onclick: (e) => { e.stopPropagation(); S.sel = sel ? null : { label: c.label, index: i }; render(true); } });
+      if (R() > 1) {   // one column per request, its replays stacked
+        if (i % R() === 0) { grp = h("span", { class: "rp-grp" }); cells.append(grp); }
+        grp.append(btn);
+      } else cells.append(btn);
+    }
+    const avg = mean(c.lat);
+    const lat = avg != null ? `avg ${fmtLat(avg)} · p95 ${fmtLat(pctl(c.lat, 0.95))}` : "no timed calls yet";
+    const legend = h("div", { class: "rp-legend" },
+      ...["ok", "rt", "ca", "er", "rn", "bo", "pend"].map(k => h("span", {}, h("i", { class: k === "pend" ? "" : `rp-${k}` }), CELL[k][1])));
+    return h("div", {},
+      h("div", { style: "margin-bottom:6px;font-size:12px" }, h("b", {}, c.label), h("span", { class: "muted" },
+        `  ·  ${c.done}/${c.calls || c.done} calls · ${c.ok} ok · ${c.cache} from cache · ${c.retried} retried · ${c.failed} failed · ${lat}`)),
+      legend, cells,
+      S.sel && S.sel.label === c.label ? cellDetail(c, S.sel.index)
+        : h("div", { class: "muted", style: "font-size:11px;margin-top:8px" }, "Click a square for that call's details."));
+  };
+
+  const renderTable = () => {
+    // Rebuilt on every update: remember which row/square had keyboard focus and restore it.
+    const f = document.activeElement;
+    const focusSel = f && tableEl.contains(f)
+      ? (f.dataset.lane ? `[data-lane="${CSS.escape(f.dataset.lane)}"]`
+        : f.dataset.cell ? `[data-cell="${CSS.escape(f.dataset.cell)}"]` : null) : null;
+    const cols = [["Candidate"], ["Status"], ["Progress"], ["Calls", 1], ["Failed", 1], ["Throttles", 1],
+      ["Avg latency", 1], ["p95", 1], ["Out tokens", 1], ["Cost", 1]];
+    const body = h("tbody");
+    for (const c of S.cands.values()) {
+      const open = S.open.has(c.label);
+      const toggle = () => { if (open) S.open.delete(c.label); else S.open.add(c.label); render(true); };
+      const pending = !c.done;
+      body.append(h("tr", {
+        class: "rp-row" + (isNow(c) ? " cur" : ""), tabindex: "0", role: "button",
+        "aria-expanded": open ? "true" : "false", "data-lane": c.label,
+        "aria-label": `${c.label}: ${open ? "hide" : "show"} each call`,
+        onclick: toggle, onkeydown: (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggle(); } },
+      },
+        h("td", { class: "mono", style: "white-space:nowrap" }, h("span", { class: "chev", "aria-hidden": "true" }, "▸"), " ", c.label),
+        h("td", {}, candStatus(c)),
+        h("td", { style: "width:24%" }, laneBar(c)),
+        h("td", { class: "num" }, `${c.done}/${c.calls || "?"}`),
+        h("td", { class: "num", style: c.failed ? "color:var(--bad)" : "" }, pending ? "—" : String(c.failed)),
+        h("td", { class: "num", style: c.throttles ? "color:var(--partial)" : "" }, String(c.throttles)),
+        h("td", { class: "num" }, fmtLat(mean(c.lat))),
+        h("td", { class: "num" }, fmtLat(pctl(c.lat, 0.95))),
+        h("td", { class: "num" }, pending ? "—" : fmtTok(c.outTok)),
+        h("td", { class: "num" }, pending ? (c.est != null && c.priceKnown ? `~${fmtUsd(c.est)} est` : "—")
+          : fmtUsd(c.cost) + (c.costUnknown ? " +?" : ""))));
+      if (open) body.append(h("tr", { class: "rp-mx" }, h("td", { colspan: String(cols.length) }, matrix(c))));
+    }
+    tableEl.replaceChildren(h("table", { class: "rp-table" },
+      h("thead", {}, h("tr", {}, ...cols.map(([t, num]) => h("th", { class: num ? "num" : "" }, t)))), body));
+    if (focusSel) { const t = tableEl.querySelector(focusSel); if (t) t.focus(); }
+  };
+
+  const renderNow = () => {
+    nowEl.style.display = "";
+    if (S.stage === "aggregate") nowEl.textContent = "All calls finished. Computing verdicts and the recommendation…";
+    else if (S.stage === "done") nowEl.textContent = "Done. Opening results…";
+    else if (S.inflight.size) nowEl.style.display = "none";
+    else if (S.planTs) nowEl.textContent = S.done ? "Between calls…" : "Waiting for the first call…";
+  };
+
+  let timer = null, lastRender = 0;
+  const render = (force) => {
+    const t = Date.now();
+    if (!force && t - lastRender < 250) {  // coalesce bursts (e.g. replayed history on open)
+      if (!timer) timer = setTimeout(() => { timer = null; render(true); }, 250);
+      return;
+    }
+    lastRender = t;
+    renderSteps(); renderBanner(); renderTimeline(); renderKpis(); renderTable(); renderFlight(); renderNow();
+    thrChip.style.display = S.throttles ? "" : "none";
+    thrChip.textContent = `${S.throttles} throttle${S.throttles === 1 ? "" : "s"}` + (slowed() && S.stage === "replay" ? ` · slowed to ${effMin()} of ${S.par}` : "");
+    errChip.style.display = S.errors ? "" : "none";
+    errChip.textContent = `${S.errors} error${S.errors === 1 ? "" : "s"}`;
+    retryChip.style.display = S.retries ? "" : "none";
+    retryChip.textContent = `${S.retries} retr${S.retries === 1 ? "y" : "ies"}`;
+  };
+  const tick = setInterval(() => render(true), 1000);  // keeps "Elapsed" and "so far" ticking
 
   const seen = new Set();
   const addLog = (line, cls) => {
@@ -657,23 +1404,107 @@ function renderProgress(el, runId) {
   const onEvent = (type, d) => {
     const key = type + JSON.stringify(d);
     if (seen.has(key)) return; seen.add(key);
-    if (type === "plan") { addLog(`▶ plan: ${d.estimated_calls} calls · est $${(d.est_cost || 0).toFixed(4)}`); }
-    else if (type === "progress") {
-      $("#progText").textContent = `${d.done}/${d.total} · ${d.model} · ${d.sample_id} (${d.status})`;
-      $("#progBar").style.width = `${100 * d.done / Math.max(d.total, 1)}%`;
+    if (d.ts != null) { S.lastTs = d.ts; S.lastLocal = Date.now(); }
+    if (type === "plan") {
+      S.planTs = d.ts ?? Date.now() / 1000;
+      S.total = d.estimated_calls || 0; S.estCost = d.est_cost ?? null; S.stage = "replay";
+      S.replays = d.replays || 1;
+      S.par = d.parallelism || S.par;
+      (d.per_candidate || []).forEach(p => {
+        const c = cand(p.model); c.calls = p.calls; c.est = p.est_cost; c.priceKnown = p.price_known !== false;
+      });
+      addLog(`▶ plan: ${d.estimated_calls} calls · est $${(d.est_cost || 0).toFixed(4)}`
+        + (S.replays > 1 ? ` · each request sent ${S.replays} times` : ""));
+    } else if (type === "pass") {
+      S.pass = d.replay || 0; S.replays = d.replays || S.replays || 1;
+      addLog(`▶ pass ${S.pass + 1} of ${S.replays}`);
+    } else if (type === "stage") {
+      S.stage = d.stage === "aggregate" ? "aggregate" : "replay";
+      if (d.replays) S.replays = d.replays;
+      if (d.parallelism) S.par = d.parallelism;
+      if (d.stage === "aggregate") S.inflight.clear();
+    } else if (type === "call_start") {
+      cand(d.model);
+      if (d.replays) S.replays = d.replays;
+      S.inflight.set(fkey(d.model, d.index, d.replay), { model: d.model, sample_id: d.sample_id, index: d.index,
+        replay: d.replay || 0, ts: d.ts ?? serverNow(), attempt: 1, max: null, reason: null, error: null,
+        backoffUntil: null, endpoint: d.endpoint });
+    } else if (type === "retry") {
+      S.retries++;
+      const f = S.inflight.get(fkey(d.model, d.index, d.replay));
+      if (f) Object.assign(f, { attempt: d.attempt, max: d.max_attempts, reason: d.reason, error: d.error,
+        backoffUntil: d.ts != null && d.wait_s ? d.ts + d.wait_s : null });
+      if (d.reason === "throttled") {
+        const ep = d.endpoint || (f && f.endpoint) || "default";
+        S.throttles++; S.throttleRetries++;
+        S.thrByEp[ep] = (S.thrByEp[ep] || 0) + 1;
+        if (d.ts != null) S.thrLast[ep] = d.ts;
+        (S.thrCands[ep] = S.thrCands[ep] || new Set()).add(d.model);
+        cand(d.model).throttles++;
+        if (S.planTs && d.ts != null) S.thrTimes.push(d.ts - S.planTs);
+      }
+      addLog(`↻ ${d.model} · ${d.sample_id} → ${retryWhy(d.reason)}, retrying (attempt ${d.attempt}/${d.max_attempts}`
+        + (d.wait_s ? `, waiting ${d.wait_s} s` : "") + `)  —  ${d.error || ""}`, "err");
+    } else if (type === "concurrency") {
+      S.eff[d.endpoint] = d.effective;
+      if (d.limit) S.par = d.limit;
+      const at = d.ts != null ? new Date(d.ts * 1000).toLocaleTimeString() : "";
+      if (S.planTs && d.ts != null) S.changes.push({ t: d.ts - S.planTs, reason: d.reason, eff: d.effective });
+      addLog(d.reason === "throttle"
+        ? `⚠ ${at} ${epText(d.endpoint)} throttled · slowed to ${d.effective} parallel call${d.effective === 1 ? "" : "s"}`
+        : `✓ ${at} ${epText(d.endpoint)} recovered · back to ${d.effective} parallel call${d.effective === 1 ? "" : "s"}`,
+        d.reason === "throttle" ? "err" : "ok");
+    } else if (type === "waiting_capacity") {
+      S.waiting = !!d.run_waiting;
+      if (S.waiting) addLog(`… waiting for capacity: ${d.server_inflight} of ${d.server_cap} calls in flight across all runs`);
+    } else if (type === "progress") {
+      const c = cand(d.model);
+      const i = d.index != null ? posOf(d.index, d.replay) : c.done;  // older servers send no index
+      if (typeof d.throttle_failures === "number" && d.throttle_failures > S.throttleFails) {
+        const ep = d.endpoint || "default";   // final attempt was throttled too: count it
+        S.throttleFails = d.throttle_failures;
+        S.thrByEp[ep] = (S.thrByEp[ep] || 0) + 1;
+        (S.thrCands[ep] = S.thrCands[ep] || new Set()).add(d.model);
+        c.throttles++;
+      }
+      if (typeof d.throttles === "number") S.throttles = Math.max(S.throttles, d.throttles);
+      c.cells[i] = d; c.done++;
+      if (c.done > c.calls) c.calls = c.done;
+      if (d.status === "error") { c.failed++; S.errors++; }
+      else {
+        c.ok++;
+        if (d.from_cache) { c.cache++; S.cache++; }
+        else {
+          if ((d.attempts || 1) > 1) c.retried++;
+          if (d.latency_ms != null) c.lat.push(d.latency_ms);
+        }
+        c.outTok += d.output_tokens || 0;
+      }
+      if (d.cost != null) { c.cost += d.cost; S.spend += d.cost; }
+      else if (d.status !== "error" && "cost" in d) { c.costUnknown = true; S.spendUnknown = true; }
+      S.done = typeof d.done === "number" ? d.done : S.done + 1;
+      S.total = d.total || S.total;
+      if (d.ts != null) S.doneTs.push(d.ts);
+      if (d.index != null) S.inflight.delete(fkey(d.model, d.index, d.replay));
+      else for (const [k, f] of S.inflight) if (f.model === d.model) { S.inflight.delete(k); break; }
       const isErr = d.status === "error";
       let line = `[${d.done}/${d.total}] ${d.model} · ${d.sample_id} → ${d.status}`;
+      if (!isErr && d.latency_ms != null) line += d.from_cache ? " (cache)" : ` · ${fmtLat(d.latency_ms)}`;
       if (isErr && d.error) line += `  —  ${d.error}`;
       addLog(line, isErr ? "err" : "");
-      if (isErr) { errCount++; errChip.textContent = `${errCount} error${errCount === 1 ? "" : "s"}`; errChip.style.display = ""; }
-    } else if (type === "done") { addLog("✓ done", "ok"); finish(); }
-    else if (type === "cancelled") { addLog("✗ cancelled", "err"); finish(); }
-    else if (type === "error") { addLog("✗ error: " + (d.error || "unknown"), "err"); finish(); }
+    } else if (type === "done") { S.stage = "done"; S.inflight.clear(); addLog("✓ done", "ok"); finish(); }
+    else if (type === "cancelled") { S.inflight.clear(); addLog("✗ cancelled", "err"); finish(); }
+    else if (type === "error") { S.inflight.clear(); addLog("✗ error: " + (d.error || "unknown"), "err"); finish(); }
+    sample();
+    render();
   };
+  render(true);
 
   let finished = false;
   const finish = () => {
     if (finished) return; finished = true;
+    clearInterval(tick); if (timer) clearTimeout(timer);
+    render(true);
     if (es) es.close(); if (poll) clearInterval(poll);
     setTimeout(() => renderResults(el, runId), 400);
   };
@@ -682,7 +1513,7 @@ function renderProgress(el, runId) {
   let es = null;
   try {
     es = new EventSource(`${API}/runs/${runId}/stream`);
-    ["plan", "progress", "done", "cancelled", "error"].forEach(t =>
+    ["plan", "pass", "stage", "call_start", "retry", "concurrency", "waiting_capacity", "progress", "done", "cancelled", "error"].forEach(t =>
       es.addEventListener(t, ev => { try { onEvent(t, JSON.parse(ev.data)); } catch {} }));
     es.addEventListener("end", finish);
     es.onerror = () => { /* fall back to polling below */ };
@@ -732,6 +1563,256 @@ function goldenCard(src) {
       h("tr", {}, h("td", { class: "muted" }, "Redaction rate"), h("td", { class: "tnum" }, `${Math.round((src.redaction_rate || 0) * 100)}%`)))));
 }
 
+// ---- Multi-objective recommendation (mockup Option A) ---------------------------------- //
+const PRESETS = [["balanced", "Balanced"], ["quality_first", "Quality"], ["cost_first", "Cost"],
+                 ["latency_first", "Latency"], ["custom", "Custom"]];
+const PROFILE_TEXT = { best_overall: "Best overall", best_quality: "Best quality",
+                       most_economical: "Most economical", lowest_latency: "Lowest latency†" };
+const PROFILE_CHIP = { best_overall: "Best overall", best_quality: "Best quality",
+                       most_economical: "Most economical", lowest_latency: "Lowest latency" };
+// Cost: unknown price is never shown as $0.
+const costPer1k = (v) => v.cost_known === false ? "Price not configured"
+  : (v.cost_per_1k_requests == null ? "—" : `$${v.cost_per_1k_requests.toFixed(2)}`);
+const costTotal = (v) => v.cost_known === false ? "price not configured" : money(v.cost_total);
+const msTok = (v) => v.ms_per_output_token_p50 == null ? "—"
+  : `${v.ms_per_output_token_p50.toFixed(1)}${v.latency_low_confidence ? " (few calls)" : ""}`;
+const pctSigned = (x) => x == null ? "—" : `${x > 0 ? "+" : ""}${Math.round(x)}%`;
+const picksFor = (rec, model) => (rec && !rec.none_eligible ? rec.profiles : [])
+  .filter(p => p.model === model).map(p => p.kind);
+
+function disclaimerNote(text) {
+  // One line by default; "Why?" expands the full disclaimer.
+  return h("details", { class: "info", style: "margin-top:14px" },
+    h("summary", {}, "† Latency numbers are indicative only — measured from this evaluation's machine and network, not production. ",
+      h("u", {}, "Why?")),
+    h("div", { style: "margin-top:6px" }, text || ""));
+}
+
+async function setWeights(runId, body) {
+  return api(`/runs/${runId}/weights`, { method: "PUT", headers: { "content-type": "application/json" },
+    body: JSON.stringify(body) });
+}
+
+function weightsControl(res, runId, onChanged) {
+  const cur = (res.weights && res.weights.preset) || "balanced";
+  const box = h("div", {});
+  const seg = h("div", { class: "seg", role: "group", "aria-label": "Optimise for" }, ...PRESETS.map(([k, t]) =>
+    h("button", { class: k === cur ? "active" : "", "aria-pressed": k === cur ? "true" : "false",
+      onclick: async () => {
+        if (k === "custom") { custom.style.display = custom.style.display === "none" ? "" : "none"; return; }
+        try { await setWeights(runId, { preset: k }); onChanged(); }
+        catch (e) { err.textContent = "Could not change weights: " + (e && e.message ? e.message : "error"); }
+      } }, t)));
+  const w = res.weights || { quality: 0.5, cost: 0.3, latency: 0.2 };
+  const vals = { quality: Math.round(w.quality * 100), cost: Math.round(w.cost * 100), latency: Math.round(w.latency * 100) };
+  const outs = {};
+  const slider = (axis, label, min) => {
+    outs[axis] = h("span", { class: "tnum" }, `${vals[axis]}`);
+    return [h("span", { class: "muted" }, label),
+      h("input", { type: "range", min: String(min), max: "100", value: String(vals[axis]), "aria-label": `${label} weight`,
+        oninput: e => { vals[axis] = parseInt(e.target.value, 10); outs[axis].textContent = String(vals[axis]); } }),
+      outs[axis]];
+  };
+  const custom = h("div", { style: cur === "custom" ? "" : "display:none" },
+    h("div", { class: "custom-weights" }, ...slider("quality", "Quality", 20), ...slider("cost", "Cost", 0),
+      ...slider("latency", "Latency", 0)),
+    h("div", { class: "row", style: "gap:8px;margin-top:8px" },
+      h("button", { class: "btn secondary", onclick: async () => {
+        try { await setWeights(runId, { preset: "custom", ...vals }); onChanged(); }
+        catch (e) { err.textContent = "Could not change weights: " + (e && e.message ? e.message : "error"); }
+      } }, "Apply custom weights"),
+      h("span", { class: "muted", style: "font-size:11px" }, "Relative weights; normalised to 100%. Quality never drops below 20%.")));
+  const err = h("div", { class: "muted", style: "font-size:12px;color:var(--bad)" });
+  box.append(h("div", { class: "row", style: "gap:8px" }, h("span", { class: "muted", style: "font-size:12px",
+    title: "Changes how much quality, cost and latency count toward Best overall. Re-ranks instantly; no models are re-run." }, "Optimise for"), seg), custom, err);
+  return box;
+}
+
+// "Why this pick": short data-driven lines from the recommendation (falls back to the old
+// one-line reason for runs whose server didn't send explanations). `extra` = [[label, lines]]
+// for the other picks the hero also holds, shown in an expander.
+function whyBox(lines, fallback, extra) {
+  if (!lines || !lines.length) return h("div", { class: "muted", style: "font-size:11px;margin-top:4px" }, fallback || "");
+  return h("div", { class: "why-box" },
+    h("div", { class: "lbl" }, "Why this pick"),
+    h("div", { class: "why-lines" }, ...lines.map(l => h("div", {}, l))),
+    (extra || []).length ? h("details", { class: "why-more" },
+      h("summary", {}, "Why it's also " + extra.map(([lab]) => lab.toLowerCase()).join(" and ")),
+      ...extra.map(([lab, ls]) => h("div", { class: "why-lines" }, h("b", {}, lab + ": "), ls.join(" ")))) : null);
+}
+
+function recommendationPanel(res, runId, onChanged) {
+  const rec = res.recommendation;
+  if (!rec) return null;
+  const byModel = Object.fromEntries((res.candidates || []).map(v => [v.model, v]));
+  const card = h("div", { class: "card", style: "margin-bottom:16px" },
+    h("div", { class: "rec-head" }, h("h3", {}, "Recommendation"), weightsControl(res, runId, onChanged)));
+
+  const ineligibleLine = () => {
+    const items = Object.entries(rec.ineligible || {});
+    if (!items.length) return null;
+    return h("div", { class: "muted", style: "font-size:12px;margin-top:10px" },
+      h("span", { title: "Only models that pass the quality gate (enough confidence, few hard breaks, few errors) can be recommended. Adjust the gate in Settings → Recommendation." },
+        "Not recommended (failed the quality gate): "),
+      ...items.flatMap(([m, rs], i) => [i ? " · " : "", h("span", { class: "mono" }, m), ` (${rs.join(", ") || "not eligible"})`]));
+  };
+
+  const EX = rec.explanations || {};
+  if (rec.none_eligible) {
+    card.append(...[h("div", { class: "banner warn" },
+      h("b", {}, "No candidate is ready to recommend. "),
+      (EX.none || []).length
+        ? [h("div", { class: "why-lines", style: "margin-top:6px" }, ...EX.none.map(l => h("div", {}, l))),
+           h("div", { style: "margin-top:4px" }, "See its remediations below, or adjust the quality gate in Settings.")]
+        : rec.closest_by_fit ? ["Closest by fit: ", h("span", { class: "mono" }, rec.closest_by_fit),
+          ". See its remediations below, or adjust the quality gate in Settings."] : ""),
+      ineligibleLine(), disclaimerNote(rec.latency_disclaimer)].filter(Boolean));
+    return card;
+  }
+
+  const profile = (k) => (rec.profiles || []).find(p => p.kind === k) || {};
+  const axes = Object.fromEntries((rec.axes || []).map(a => [a.model, a]));
+  const bo = profile("best_overall");
+  const v = byModel[bo.model] || {};
+  const ax = axes[bo.model] || {};
+  // Option A: hero with confidence ring + score composition; picks the hero also holds become
+  // chips; only genuinely different alternatives get their own card.
+  const w = rec.weights || res.weights || { quality: 0.5, cost: 0.3, latency: 0.2 };
+  const others = (rec.profiles || []).filter(p => p.kind !== "best_overall");
+  const also = others.filter(p => p.model && p.model === bo.model);
+  const diff = others.filter(p => !p.model || p.model !== bo.model);
+  const scored = v.scored || 0;
+  const hardN = Math.round((v.hard_break_rate || 0) * scored);
+  const segs = [["Quality", ax.quality_score, w.quality, "var(--ok)"], ["Cost", ax.cost, w.cost, "var(--accent)"],
+                ["Latency", ax.latency, w.latency, "var(--drift)"]]
+    .map(([n, val, wt, col]) => ({ n, col, max: 100 * (wt || 0), pts: val == null ? null : val * (wt || 0) }));
+  const comp = h("div", { class: "score-comp", role: "img",
+    "aria-label": "Score made of " + segs.map(s => `${s.n.toLowerCase()} ${s.pts == null ? "not included" : s.pts.toFixed(1)} of ${s.max.toFixed(0)}`).join(", ") },
+    ...segs.filter(s => s.pts).map(s => h("span", { style: `width:${s.pts}%;background:${s.col}`, title: `${s.n} ${s.pts.toFixed(1)} of ${s.max.toFixed(0)}` })));
+  const stat = (k, val, unit, sub) => h("div", { class: "hstat" }, h("div", { class: "lbl" }, k),
+    h("div", { class: "v tnum" }, val, unit ? h("small", {}, " " + unit) : null), h("div", { class: "sub" }, sub));
+  const hero = h("div", { class: "pcard hero" },
+    h("div", { class: "lbl" }, "Best overall"),
+    h("div", { class: "hero-top" },
+      h("div", { class: "ringwrap" }, confRing(v.migration_confidence, BAND_COLOR[v.verdict_band] || "var(--ok)", 112),
+        ciText(v) ? h("div", { class: "ci-line", title: CI_TITLE }, ciText(v)) : null),
+      h("div", { style: "flex:1;min-width:0" },
+        h("div", { class: "pick" }, bo.model || "—"),
+        h("div", { class: "row", style: "gap:6px;flex-wrap:wrap;margin:6px 0 12px" },
+          v.verdict_band ? h("span", { class: "band " + v.verdict_band }, BAND_TEXT[v.verdict_band]) : null,
+          ...also.map(p => h("span", { class: "chip" }, "also " + PROFILE_CHIP[p.kind]))),
+        ax.composite != null ? [
+          h("div", { class: "row spread", style: "font-size:12px" },
+            h("span", { class: "muted", title: "Weighted score out of 100 combining quality, cost and latency with the weights chosen above. Only comparable within this run." },
+              "Overall score ", h("b", { style: "color:var(--text)" }, ax.composite.toFixed(1)), " / 100"),
+            h("span", { class: "muted" }, "what it's made of")),
+          comp,
+          h("div", { class: "legend" }, ...segs.map(s => h("span", {}, h("i", { style: `background:${s.col}` }),
+            `${s.n} ${s.pts == null ? "not included" : s.pts.toFixed(1) + " / " + s.max.toFixed(0)}${s.n === "Latency" ? "†" : ""}`)))] : null)),
+    h("div", { class: "hstats" },
+      stat("Cost / 1K requests", costPer1k(v), null,
+        v.cost_vs_current_pct == null ? "list price, no caching" : `${pctSigned(v.cost_vs_current_pct)} vs current`),
+      stat("Speed†", v.ms_per_output_token_p50 == null ? "—" : v.ms_per_output_token_p50.toFixed(1), "ms/token",
+        v.latency_p95_ms == null ? "" : `p95 ${fmtLat(v.latency_p95_ms)} per request`),
+      stat("Hard breaks", String(hardN), `of ${scored}`, `${fmtPct((v.hard_break_rate || 0) * 100)} of answers`),
+      v.consistency != null
+        ? stat("Consistency (D7)", v.consistency.toFixed(2), null,
+            `${v.unstable_requests || 0} unstable of ${v.consistency_measured || 0} requests × ${v.replays}`
+            + (v.consistency_low_confidence ? " · few requests" : ""))
+        : null),
+    h("div", { class: "muted", style: "font-size:11px;margin-top:12px" },
+      "Quality = how closely answers match your current model (Migration Confidence) · Cost = list price per 1,000 requests · Speed = milliseconds per word-piece (token) generated, lower is faster"),
+    whyBox(EX.best_overall, bo.reason,
+      also.filter(p => (EX[p.kind] || []).length).map(p => [PROFILE_CHIP[p.kind], EX[p.kind]])));
+
+  const altCard = (p) => {
+    const av = byModel[p.model] || {};
+    const lines = p.model ? (EX[p.kind] || []) : [];
+    return h("div", { class: "pcard" },
+      h("div", { class: "lbl" }, PROFILE_TEXT[p.kind]),
+      h("div", { class: "row spread", style: "gap:8px" },
+        h("div", { class: "pick" }, p.model || "No candidate qualifies"),
+        av.verdict_band ? h("span", { class: "band " + av.verdict_band }, BAND_TEXT[av.verdict_band]) : null),
+      lines.length
+        ? h("div", { class: "why why-lines" }, ...lines.map(l => h("div", {}, l)))
+        : h("div", { class: "why" + (p.model ? "" : " none") }, p.model ? (p.tradeoff || p.reason || "") : (p.reason || "")));
+  };
+  const inelItems = Object.entries(rec.ineligible || {});
+  const gateBox = inelItems.length ? h("div", { class: "pcard gate" },
+    h("div", { class: "lbl", title: "Only models that pass the quality gate (enough confidence, few hard breaks, few errors) can be recommended. Adjust the gate in Settings → Recommendation." },
+      "Didn't pass the quality gate"),
+    ...inelItems.map(([m, rs]) => h("div", { style: "font-size:12px;margin-top:6px" },
+      h("span", { class: "mono" }, m), h("span", { class: "muted" }, " · " + (rs.join("; ") || "not eligible"))))) : null;
+  card.append(h("div", { class: "rec-grid" }, hero,
+    h("div", { class: "rec-side" }, ...diff.map(altCard), gateBox,
+      !diff.length && !gateBox ? h("div", { class: "pcard" }, h("div", { class: "why none" },
+        "Best overall is also the best on quality, cost and latency.")) : null)));
+  (rec.notes || []).forEach(n => card.append(h("div", { class: "muted", style: "font-size:12px;margin-top:8px" }, n)));
+  card.append(disclaimerNote(rec.latency_disclaimer));
+  return card;
+}
+
+const BAND_COLOR = { safe_drop_in: "var(--ok)", drop_in_with_prompt_tuning: "var(--drift)",
+                     needs_work: "var(--partial)", not_a_drop_in: "var(--bad)" };
+const SVGNS = "http://www.w3.org/2000/svg";
+const sv = (tag, attrs = {}, text) => {
+  const e = document.createElementNS(SVGNS, tag);
+  for (const [k, val] of Object.entries(attrs)) if (val != null) e.setAttribute(k, val);
+  if (text != null) e.textContent = text;
+  return e;
+};
+
+// Confidence (0-100) as a ring, coloured by verdict band.
+// 95% bootstrap interval of a candidate's Migration Confidence, e.g. "95% CI 79–97" (null if not computed).
+function ciText(v, prefix = "95% CI ") {
+  return v && v.confidence_ci_low != null && v.confidence_ci_high != null
+    ? `${prefix}${Math.round(v.confidence_ci_low)}–${Math.round(v.confidence_ci_high)}` : null;
+}
+const CI_TITLE = "95% confidence interval from a bootstrap over the requests: the range the score would likely "
+  + "land in with a different sample of requests like these. Fewer requests = a wider range.";
+
+function confRing(conf, color, size) {
+  const r = size / 2 - 8, c = 2 * Math.PI * r, mid = size / 2, val = Math.max(0, Math.min(100, conf || 0));
+  const s = sv("svg", { width: size, height: size, viewBox: `0 0 ${size} ${size}`, role: "img",
+    "aria-label": `Migration Confidence ${val.toFixed(0)}%`, class: "conf-ring" });
+  s.append(sv("circle", { cx: mid, cy: mid, r, fill: "none", stroke: "var(--surface)", "stroke-width": 10 }),
+    sv("circle", { cx: mid, cy: mid, r, fill: "none", stroke: color, "stroke-width": 10, "stroke-linecap": "round",
+      "stroke-dasharray": `${c * val / 100} ${c}`, transform: `rotate(-90 ${mid} ${mid})` }),
+    sv("text", { x: mid, y: mid + 2, "text-anchor": "middle", fill: "var(--text)", "font-size": size * 0.21, "font-weight": 700 }, `${Math.round(val)}%`),
+    sv("text", { x: mid, y: mid + size * 0.17, "text-anchor": "middle", fill: "var(--muted)", "font-size": 10 }, "confidence"));
+  return s;
+}
+
+// Per-request latency as a range: p50 dot, average tick, bar out to p95 (shared scale).
+function latencyRange(v, maxMs) {
+  const { latency_p50_ms: p50, latency_avg_ms: avg, latency_p95_ms: p95 } = v;
+  if (p50 == null || p95 == null || !maxMs) return h("span", { class: "muted" }, "—");
+  const W = 150, X = (ms) => 6 + Math.min(ms, maxMs) / maxMs * (W - 12);
+  const s = sv("svg", { width: W, height: 34, viewBox: `0 0 ${W} 34`, class: "lat-range", role: "img",
+    "aria-label": `Latency per request: median ${fmtLat(p50)}, average ${fmtLat(avg)}, p95 ${fmtLat(p95)}` });
+  s.append(...[sv("title", {}, `p50 ${fmtLat(p50)} · avg ${fmtLat(avg)} · p95 ${fmtLat(p95)}`),
+    sv("line", { x1: 6, x2: W - 6, y1: 17, y2: 17, stroke: "var(--border)" }),
+    sv("line", { x1: X(p50), x2: X(p95), y1: 17, y2: 17, stroke: "var(--drift)", "stroke-width": 5, "stroke-linecap": "round", "stroke-opacity": 0.45 }),
+    sv("circle", { cx: X(p50), cy: 17, r: 4.5, fill: "var(--drift)" }),
+    avg != null ? sv("line", { x1: X(avg), x2: X(avg), y1: 9, y2: 25, stroke: "var(--text)", "stroke-width": 1.5 }) : null,
+    sv("text", { x: X(p50), y: 7, "text-anchor": "middle", fill: "var(--muted)", "font-size": 9 }, fmtLat(p50)),
+    sv("text", { x: Math.min(X(p95), W - 2), y: 33, "text-anchor": "end", fill: "var(--muted)", "font-size": 9 }, fmtLat(p95))]
+    .filter(Boolean));
+  return s;
+}
+
+// Marks the best value in a column/row. A trophy, not an arrow: an arrow reads as
+// "this metric went up", which is not what it means.
+const BEST_ICON = "🏆";
+
+// A number with a small comparison bar; best value in the column marked with BEST_ICON.
+function barCell(text, frac, color, best) {
+  return h("td", { class: "tnum barcell" }, h("div", { class: "bc" },
+    h("span", {}, text, best ? h("span", { class: "bestmark", title: "Best in this column" }, BEST_ICON) : null),
+    frac == null ? null : h("div", { class: "axbar" },
+      h("span", { style: `width:${Math.max(3, Math.min(100, 100 * frac))}%;background:${color}` }))));
+}
+
 async function renderResults(el, runId) {
   clear(el);
   const res = await api(`/runs/${runId}/results`);
@@ -745,8 +1826,7 @@ async function renderResults(el, runId) {
       h("h3", {}, "Run failed"),
       h("div", { class: "banner err" }, why),
       h("p", { class: "muted", style: "margin-top:10px" },
-        "Fix the cause above and start a new run. Tip: GPT-5.4 is Bedrock Mantle-only — either pick a "
-        + "runtime model (GPT-5.6 Luna / Terra / Sol) or start the server with a Bedrock API key for the Mantle endpoint."),
+        "Fix the cause above and start a new run."),
       h("button", { class: "btn", style: "margin-top:12px", onclick: () => go("new") }, "Start a new run"),
       h("a", { class: "btn ghost", style: "margin-top:12px;margin-left:8px",
                href: `${API}/runs/${runId}/report.pdf`, target: "_blank", rel: "noopener" },
@@ -773,7 +1853,14 @@ async function renderResults(el, runId) {
                target: "_blank", rel: "noopener", title: "Light theme, better for printing" }, "Print-friendly PDF"),
       h("a", { class: "btn", href: `${API}/runs/${runId}/report.pdf`,
                target: "_blank", rel: "noopener" }, "⬇ Download PDF report"))));
+  if (res.exec_summary) el.append(h("div", { class: "muted", style: "font-size:12px;margin:-6px 0 12px" },
+    res.exec_summary + ((res.parallelism || 1) > 1 ? ". Latency was measured with parallel calls." : ".")));
   (res.caveats || []).forEach(c => el.append(h("div", { class: "banner warn", style: "margin-bottom:14px" }, c)));
+  // Recommendation (all things considered) — above the per-candidate detail.
+  const recPanel = recommendationPanel(res, runId, () => renderResults(el, runId));
+  if (recPanel) el.append(recPanel);
+  const rec = res.recommendation;
+  const axesBy = Object.fromEntries(((rec && rec.axes) || []).map(a => [a.model, a]));
   // Golden / existing baseline (what was ingested)
   try {
     const src = await api(`/runs/${runId}/source`);
@@ -786,13 +1873,24 @@ async function renderResults(el, runId) {
     const total = Object.values(dist).reduce((a, b) => a + b, 0) || 1;
     const bar = h("div", { class: "distbar", style: "margin:12px 0" },
       ...LABELS.map(l => h("span", { class: l, style: `width:${100 * (dist[l] || 0) / total}%` })));
+    const picks = picksFor(rec, v.model);
+    const elig = v.eligible === undefined ? null
+      : (v.eligible ? h("div", { class: "elig ok" }, "Passed the quality gate")
+                    : h("div", { class: "elig no", title: "A hard break is an answer that changes a critical fact (a dose, an ID, an amount) or breaks the required format." },
+                        "Not recommended: " + ((v.ineligible_reasons || []).join(", ") || "failed the quality gate")));
     const card = h("div", { class: "candcard", title: "Click to view this model's evaluations" },
       h("div", { class: "row spread" }, h("strong", {}, v.model), h("span", { class: "band " + v.verdict_band }, BAND_TEXT[v.verdict_band])),
       v.endpoint ? h("div", { class: "muted mono", style: "margin-top:4px;font-size:11px" }, "via " + (ENDPOINT_TEXT[v.endpoint] || v.endpoint)) : null,
-      h("div", { class: "metric", style: "margin-top:10px" }, h("div", { class: "value tnum" }, fmtPct(v.migration_confidence)), h("div", { class: "label" }, "Migration Confidence")),
+      picks.length ? h("div", { class: "row", style: "gap:6px;margin-top:6px;flex-wrap:wrap" },
+        ...picks.map(k => h("span", { class: "chip pick" }, PROFILE_CHIP[k]))) : null,
+      elig,
+      h("div", { class: "metric", style: "margin-top:10px" }, h("div", { class: "value tnum" }, fmtPct(v.migration_confidence)), h("div", { class: "label" }, "Migration Confidence"),
+        ciText(v) ? h("div", { class: "ci-line", title: CI_TITLE }, ciText(v)) : null),
       bar,
       h("div", { class: "muted mono", style: "font-size:12px" }, LABELS.map(l => `${(dist[l] || 0)} ${LABEL_TEXT[l]}`).join(" · ")),
-      h("div", { class: "muted", style: "margin-top:8px;font-size:12px" }, `hard-break ${fmtPct(v.hard_break_rate * 100)} · ${money(v.cost_total)} · ${v.latency_avg_ms == null ? "—" : Math.round(v.latency_avg_ms) + " ms avg"}`),
+      (v.replays || 1) > 1 ? h("div", { class: "muted", style: "font-size:11px;margin-top:2px" },
+        `${v.scored} answers · ${v.requests_scored} request${v.requests_scored === 1 ? "" : "s"} × ${v.replays} replays`) : null,
+      h("div", { class: "muted", style: "margin-top:8px;font-size:12px" }, `hard-break ${fmtPct(v.hard_break_rate * 100)} · ${costTotal(v)} · ${v.latency_avg_ms == null ? "—" : Math.round(v.latency_avg_ms) + " ms avg†"}`),
       dimBars(v.dimension_averages),
       h("div", { class: "muted", style: "margin-top:8px;font-size:11px;color:var(--accent)" }, "View evaluations →"));
     card.addEventListener("click", () => openCandidate(el, runId, v.model));
@@ -800,28 +1898,94 @@ async function renderResults(el, runId) {
   });
   el.append(h("h3", {}, "Results"), cardsWrap);
 
-  // side-by-side comparison table
-  const ms = (x) => (x == null ? "—" : `${Math.round(x)} ms`);
+  // side-by-side comparison table: inline comparison bars, best value marked, latency as a range plot
+  const cands = res.candidates;
+  const nums = (f) => cands.map(f).filter(x => typeof x === "number" && isFinite(x));
+  // frac for the bar: higher-is-better scales by max; lower-is-better by min/value.
+  const scale = (f, dir) => {
+    const vs = nums(f); if (!vs.length) return () => [null, false];
+    const mx = Math.max(...vs), mn = Math.min(...vs), spread = mx - mn > 1e-9 && vs.length > 1;
+    return (v) => {
+      const x = f(v);
+      if (typeof x !== "number" || !isFinite(x)) return [null, false];
+      const frac = dir > 0 ? (mx ? x / mx : 0) : (x > 0 ? mn / x : 1);
+      return [frac, spread && x === (dir > 0 ? mx : mn)];
+    };
+  };
+  const cConf = scale(v => v.migration_confidence, 1), cHb = scale(v => v.hard_break_rate, -1),
+        cCost = scale(v => (v.cost_known === false ? null : v.cost_per_1k_requests), -1),
+        cTok = scale(v => v.ms_per_output_token_p50, -1),
+        cScore = scale(v => (axesBy[v.model] || {}).composite, 1);
+  const hasD7 = cands.some(v => v.consistency != null);
+  const cD7 = scale(v => v.consistency, 1);
+  const maxP95 = Math.max(0, ...nums(v => v.latency_p95_ms));
+  const heads = [["Candidate"], ["Verdict"], ["Confidence", 1], ["Hard-break", 1], ...(hasD7 ? [["Consistency (D7)", 1]] : []),
+                 ["Cost / 1K req", 1], ["vs current", 1],
+                 ["Answer length", 1], ["ms / token†", 1], ["Latency per request†"], ["Overall score", 1], ["Picks"]];
   el.append(h("h3", { style: "margin-top:20px" }, "Side-by-side"),
-    h("table", {}, h("thead", {}, h("tr", {}, ...["Candidate", "Confidence", "Hard-break", "Cost", "Latency avg", "Latency p95", "Verdict"].map(t => h("th", {}, t)))),
-      h("tbody", {}, ...res.candidates.map(v => {
-        const tr = h("tr", { title: "Click to view this model's evaluations" },
-          h("td", { class: "mono" }, v.model), h("td", { class: "tnum" }, fmtPct(v.migration_confidence)),
-          h("td", { class: "tnum" }, fmtPct(v.hard_break_rate * 100)), h("td", { class: "tnum" }, money(v.cost_total)),
-          h("td", { class: "tnum" }, ms(v.latency_avg_ms)), h("td", { class: "tnum" }, ms(v.latency_p95_ms)),
-          h("td", {}, h("span", { class: "band " + v.verdict_band }, BAND_TEXT[v.verdict_band])));
+    h("div", { class: "table-scroll" },
+    h("table", { class: "sbs" }, h("thead", {}, h("tr", {}, ...heads.map(([t, num]) => h("th", { scope: "col", class: num ? "num" : "" }, t)))),
+      h("tbody", {}, ...cands.map(v => {
+        const a = axesBy[v.model];
+        const picks = picksFor(rec, v.model);
+        const out = v.eligible === false;
+        const [fc, bc] = cConf(v), [fh, bh] = cHb(v), [fco, bco] = cCost(v), [ft, bt] = cTok(v), [fs, bs] = cScore(v);
+        const tr = h("tr", { class: out ? "inel" : "", title: "Click to view this model's evaluations" },
+          h("td", { class: "mono" }, v.model),
+          h("td", {}, h("span", { class: "band " + v.verdict_band }, BAND_TEXT[v.verdict_band]),
+            v.unstable ? h("span", { class: "band unstable", style: "margin-left:4px",
+              title: "Average consistency (D7) is below the instability threshold: answers to the same request vary a lot." }, "Unstable") : null),
+          (() => {
+            const td = barCell(fmtPct(v.migration_confidence), fc, "var(--ok)", bc);
+            const ci = ciText(v, "");
+            const tied = (rec && rec.quality_ties || []).includes(v.model);
+            if (ci) td.append(h("div", { class: "ci-line", style: "text-align:right", title: CI_TITLE },
+              ci, tied ? h("span", { class: "tiechip", title: "Statistically tied with the best-quality candidate: the data can't separate them on quality" }, "≈ tied") : null));
+            return td;
+          })(),
+          barCell(fmtPct(v.hard_break_rate * 100), fh, "var(--bad)", bh),
+          ...(hasD7 ? [(() => {
+            const [fd, bd] = cD7(v);
+            const td = barCell(v.consistency == null ? "—" : v.consistency.toFixed(2), fd, "var(--accent)", bd);
+            if (v.consistency != null) td.append(h("div", { class: "muted", style: "font-size:11px;text-align:right" },
+              `${v.unstable_requests || 0} unstable` + (v.flip_rate ? ` · ${fmtPct(v.flip_rate * 100)} flip` : "")));
+            return td;
+          })()] : []),
+          barCell(costPer1k(v), fco, "var(--accent)", bco),
+          h("td", { class: "tnum num" }, pctSigned(v.cost_vs_current_pct)),
+          h("td", { class: "tnum num", title: "Answer length vs your current model: 1.5× means 50% longer (and costlier)" },
+            v.output_token_ratio == null ? "—" : `${v.output_token_ratio.toFixed(2)}×`),
+          barCell(msTok(v), ft, "var(--drift)", bt),
+          h("td", {}, latencyRange(v, maxP95)),
+          barCell(a && a.composite != null ? a.composite.toFixed(1) : "—", fs, "var(--ok)", bs),
+          h("td", {}, picks.length
+            ? h("div", { class: "row", style: "gap:4px;flex-wrap:nowrap" }, ...picks.map(k => h("span", { class: "chip" + (k === "best_overall" ? " pick" : "") }, PROFILE_CHIP[k])))
+            : out ? h("span", { class: "muted", style: "font-size:12px" }, "Not eligible: " + ((v.ineligible_reasons || []).join("; ") || "failed the quality gate"))
+            : h("span", { class: "muted" }, "—")));
         tr.addEventListener("click", () => openCandidate(el, runId, v.model));
         return tr;
-      }))));
+      })))),
+    h("div", { class: "legend", style: "margin-top:8px" },
+      h("span", {}, "Latency per request: "),
+      h("span", {}, h("i", { class: "dot", style: "background:var(--drift)" }), "median (p50)"),
+      h("span", {}, h("i", { class: "tick" }), "average"),
+      h("span", {}, h("i", { style: "background:rgba(34,211,238,.45);width:18px" }), "out to p95 (slowest 5%)")),
+    h("div", { class: "muted", style: "font-size:11px;margin-top:6px" },
+      "Bars compare candidates within each column; 🏆 marks the best. The range under Confidence is its 95% interval; "
+      + "≈ tied means it can't be separated from the best on quality. Dimmed rows didn't pass the quality gate. "
+      + "Cost is list price at current public Bedrock rates, assuming no prompt caching; vs current compares the same requests against today's model, when its price is known. "
+      + "† Latency is indicative only (see the note above). Overall score is the weighted recommendation score; only models that passed the gate get one."));
 
   // D1–D6 × candidate breakdown: why one model beats another, without drilling in.
-  const breakdown = dimBreakdown(res.candidates);
+  const breakdown = dimBreakdown(res.candidates, rec);
   if (breakdown) {
     el.append(h("div", { class: "row spread", style: "margin-top:20px" },
       h("h3", { style: "margin:0" }, "Dimension breakdown"),
-      h("span", { class: "muted", style: "font-size:11px" }, "average score per dimension · 0.00–1.00 · best per row marked ▲")),
+      h("span", { class: "muted", style: "font-size:11px" }, "average score per dimension · 0.00–1.00 · green ≥ 0.85 · amber 0.60–0.85 · red < 0.60 · best per row 🏆"
+        + (rec && !rec.none_eligible ? " · tinted columns are the recommended picks (outlined = Best overall)" : ""))),
       breakdown);
   }
+  if (res.candidates.some(v => v.consistency != null)) el.append(leastConsistentCard(el, runId, res.candidates));
 
   // candidate selector + drill-down actions
   const models = res.candidates.map(v => v.model);
@@ -845,36 +2009,51 @@ function openCandidate(el, runId, model) {
   if (drill) drill.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
-async function loadSamples(el, runId, model) {
+async function loadSamples(el, runId, model, opts = {}) {
   const drill = $("#drill"); clear(drill); drill.append(h("div", { class: "skeleton" }));
-  const data = await api(`/runs/${runId}/samples?candidate=${encodeURIComponent(model)}&limit=200`);
+  const data = await api(`/runs/${runId}/samples?candidate=${encodeURIComponent(model)}&limit=500`
+    + (opts.unstable ? "&unstable=true" : ""));
   clear(drill);
   const detail = h("div", { id: "sampleDetail" });
+  const reps = Math.max(1, ...data.items.map(p => p.replays || 1));
   const rows = data.items.map(p => {
+    const c = p.consistency;
     const tr = h("tr", { title: "Click for full request/response detail" },
       h("td", { class: "mono" }, p.sample_id),
+      reps > 1 ? h("td", { class: "tnum" }, `${(p.replay_index || 0) + 1} / ${reps}`) : null,
       h("td", {}, h("span", { class: "pill " + labelKey(p) }, LABEL_TEXT[labelKey(p)])),
       h("td", { class: "tnum" }, (p.d1_semantic?.score ?? 0).toFixed(2)),
       h("td", { class: "tnum" }, (p.d2_format?.score ?? 0).toFixed(2)),
       h("td", { class: "tnum" }, (p.d3_factual?.score ?? 0).toFixed(2)),
       h("td", { class: "tnum" }, (p.d4_verbosity?.score ?? 0).toFixed(2)),
+      reps > 1 ? h("td", { class: "tnum" }, c && c.d7 != null
+        ? [h("span", { style: `color:${scoreColor(c.d7)}` }, c.d7.toFixed(2)), c.unstable ? h("span", { class: "band unstable", style: "margin-left:4px" }, "Unstable") : null]
+        : "—") : null,
       h("td", { class: "muted" }, p.judge_reason || (p.hard_break ? "hard-break" : "—")));
-    tr.addEventListener("click", () => showSampleDetail(detail, runId, model, p.sample_id));
+    tr.addEventListener("click", () => showSampleDetail(detail, runId, model, p.sample_id, p.replay_index || 0));
     return tr;
   });
-  drill.append(h("h3", {}, `Evaluations · ${model} (${data.total})`),
-    h("div", { class: "muted", style: "font-size:12px;margin-bottom:6px" }, "Every request evaluated for this candidate. Click a row to see the original vs candidate request/response, models and latency."),
-    h("table", {}, h("thead", {}, h("tr", {}, ...["Request", "Label", "D1", "D2", "D3", "D4", "Reason"].map(t => h("th", {}, t)))),
+  const filter = reps > 1 || opts.unstable ? h("label", { class: "row", style: "gap:6px;font-size:12px;cursor:pointer" },
+    h("input", { type: "checkbox", checked: !!opts.unstable,
+      onchange: (e) => loadSamples(el, runId, model, { unstable: e.target.checked }) }),
+    "Unstable requests only") : null;
+  const heads = ["Request", ...(reps > 1 ? ["Replay"] : []), "Label", "D1", "D2", "D3", "D4", ...(reps > 1 ? ["D7"] : []), "Reason"];
+  drill.append(h("div", { class: "row spread" }, h("h3", {}, `Evaluations · ${model} (${data.total}${reps > 1 ? " answers" : ""})`), filter),
+    h("div", { class: "muted", style: "font-size:12px;margin-bottom:6px" },
+      reps > 1 ? `Each request was sent ${reps} times; every answer is listed and scored. D7 is the request's consistency across its answers. Click a row to see it, with tabs for the other replays.`
+               : "Every request evaluated for this candidate. Click a row to see the original vs candidate request/response, models and latency."),
+    h("table", {}, h("thead", {}, h("tr", {}, ...heads.map(t => h("th", {}, t)))),
       h("tbody", {}, ...rows)),
     detail);
 }
 
-async function showSampleDetail(host, runId, model, sampleId) {
+async function showSampleDetail(host, runId, model, sampleId, replay) {
   clear(host);
   host.append(h("div", { class: "skeleton", style: "margin-top:14px" }));
   let d;
   try {
-    d = await api(`/runs/${runId}/samples/${encodeURIComponent(sampleId)}?candidate=${encodeURIComponent(model)}`);
+    d = await api(`/runs/${runId}/samples/${encodeURIComponent(sampleId)}?candidate=${encodeURIComponent(model)}`
+      + (replay != null ? `&replay=${replay}` : ""));
   } catch (e) {
     clear(host); host.append(h("div", { class: "banner err" }, "Could not load sample: " + (e && e.message ? e.message : "error"))); return;
   }
@@ -898,6 +2077,7 @@ async function showSampleDetail(host, runId, model, sampleId) {
     h("div", { class: "row spread" },
       h("h3", { style: "margin:0" }, `Sample ${sampleId}`),
       h("span", { class: "pill " + labelKey(sc) }, LABEL_TEXT[labelKey(sc)] || "—")),
+    (d.replays || 1) > 1 ? replayTabs(host, runId, model, sampleId, d, respText, ms) : null,
     // request (shared — the candidate replays the same request)
     h("div", { style: "margin-top:12px" },
       pane("Request (replayed to both)", `original model: ${o.model || "—"}`,
@@ -917,6 +2097,90 @@ function scoreColor(v) {
   if (v >= 0.85) return "var(--ok)";
   if (v >= 0.6) return "var(--partial)";
   return "var(--bad)";
+}
+
+// ---- Replays: tabs per answer, the request's D7, and a diff of the two most different answers.
+const LABEL_DOT = { compatible: "var(--ok)", compatible_with_drift: "var(--drift)", partial: "var(--partial)", incompatible: "var(--bad)" };
+function labelDots(labels) {
+  return h("span", { class: "ldots", role: "img", "aria-label": "Labels per replay: " + labels.map(l => LABEL_TEXT[l] || l).join(", ") },
+    ...labels.map(l => h("i", { style: `background:${LABEL_DOT[l] || "var(--muted)"}`, title: LABEL_TEXT[l] || l })));
+}
+
+function replayTabs(host, runId, model, sampleId, d, respText, ms) {
+  const cons = d.consistency || {};
+  const tabs = h("div", { class: "seg", role: "tablist", "aria-label": "Replays of this request" },
+    ...(d.answers || []).map(a => h("button", {
+      role: "tab", "aria-selected": a.replay_index === d.replay ? "true" : "false",
+      class: a.replay_index === d.replay ? "active" : "",
+      onclick: () => showSampleDetail(host, runId, model, sampleId, a.replay_index) },
+      h("i", { class: "tabdot", style: `background:${a.status === "error" ? "var(--bad)" : (LABEL_DOT[a.label] || "var(--muted)")}` }),
+      `Replay ${a.replay_index + 1}`)));
+  const box = h("div", { class: "replaybox" },
+    h("div", { class: "row spread", style: "flex-wrap:wrap;gap:8px" },
+      h("div", { class: "row", style: "gap:10px;flex-wrap:wrap" }, h("span", { class: "muted", style: "font-size:12px" },
+        `Sent ${d.replays} times`), tabs),
+      cons.d7 != null
+        ? h("div", { class: "row", style: "gap:8px;font-size:12px" },
+            h("span", {}, "Consistency (D7) ", h("b", { class: "tnum", style: `color:${scoreColor(cons.d7)}` }, cons.d7.toFixed(2))),
+            h("span", { class: "muted" }, `answers ${(cons.answer_agreement ?? 0).toFixed(2)} · verdicts ${(cons.verdict_agreement ?? 0).toFixed(2)}`),
+            cons.unstable ? h("span", { class: "band unstable" }, "Unstable") : null,
+            cons.flip ? h("span", { class: "band not_a_drop_in", title: "Some answers hard-break and some don't" }, "Flips") : null)
+        : h("span", { class: "muted", style: "font-size:12px" }, "Consistency not measured (fewer than 2 successful answers)")));
+  const pair = cons.most_different_pair;
+  const byRep = Object.fromEntries((d.answers || []).map(a => [a.replay_index, a]));
+  if (pair && byRep[pair[0]] && byRep[pair[1]]) {
+    const A = byRep[pair[0]], B = byRep[pair[1]];
+    const asSide = (a) => ({ model: `replay ${a.replay_index + 1} · ${LABEL_TEXT[a.label] || a.status}`, status: a.status, error: a.error,
+      latency_ms: a.latency_ms, usage: {}, cost_estimate: a.cost_estimate, response: { text: a.text, tool_calls: a.tool_calls } });
+    box.append(h("details", { class: "cmpreplays" },
+      h("summary", {}, `Compare the two most different answers (replay ${pair[0] + 1} vs ${pair[1] + 1})`),
+      responseCompare({ ...asSide(A), response: { text: A.text, tool_calls: A.tool_calls } }, asSide(B), respText, ms,
+        [`Replay ${pair[0] + 1}`, `Replay ${pair[1] + 1}`])));
+  }
+  return box;
+}
+
+// Results page: requests whose answers varied most across replays.
+function leastConsistentCard(el, runId, cands) {
+  const measured = cands.filter(v => v.consistency != null);
+  const sel = h("select", { style: "width:auto", "aria-label": "Candidate" }, ...measured.map(v => h("option", { value: v.model }, v.model)));
+  const body = h("div", {});
+  const load = async () => {
+    body.replaceChildren(h("div", { class: "skeleton" }));
+    let data;
+    try { data = await api(`/runs/${runId}/candidates/${encodeURIComponent(sel.value)}/consistency?limit=10`); }
+    catch (e) { body.replaceChildren(h("div", { class: "muted" }, "Could not load: " + (e && e.message ? e.message : "error"))); return; }
+    if (!data.items.length) { body.replaceChildren(h("div", { class: "muted", style: "font-size:12px" }, "No requests with two or more successful answers.")); return; }
+    body.replaceChildren(h("table", { class: "lc-table" },
+      h("thead", {}, h("tr", {}, ...["Request", "D7", "Labels per replay", "", ""].map(t => h("th", { scope: "col" }, t)))),
+      h("tbody", {}, ...data.items.map(it => {
+        const tr = h("tr", { tabindex: "0", title: "Open this request's answers" },
+          h("td", {}, h("div", { class: "mono" }, it.sample_id), h("div", { class: "muted lc-prev" }, it.prompt_preview || "")),
+          h("td", { class: "tnum" }, h("b", { style: `color:${scoreColor(it.d7)}` }, it.d7.toFixed(2))),
+          h("td", {}, labelDots(it.labels)),
+          h("td", {}, it.flip ? h("span", { class: "band not_a_drop_in", title: "Some answers hard-break and some don't" }, "Flips") : null),
+          h("td", {}, it.unstable ? h("span", { class: "band unstable" }, "Unstable") : null));
+        const open = () => {
+          const s = document.getElementById("candSelect"); if (s) s.value = sel.value;
+          loadSamples(el, runId, sel.value).then(() => {
+            const det = document.getElementById("sampleDetail");
+            if (det) showSampleDetail(det, runId, sel.value, it.sample_id, (it.most_different_pair || [0])[0]);
+          });
+        };
+        tr.addEventListener("click", open);
+        tr.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); open(); } });
+        return tr;
+      }))));
+  };
+  sel.addEventListener("change", load);
+  const card = h("div", { style: "margin-top:20px" },
+    h("div", { class: "row spread" }, h("h3", { style: "margin:0" }, "Least consistent requests"),
+      h("div", { class: "row", style: "gap:8px" }, h("span", { class: "muted", style: "font-size:12px" }, "Candidate"), sel)),
+    h("div", { class: "muted", style: "font-size:11px;margin:4px 0 8px" },
+      "Requests whose answers varied most when replayed (lowest D7 first). Each dot is one replay's label. Click a row to compare its answers."),
+    body);
+  load();
+  return card;
 }
 
 // ---- response diff ---------------------------------------------------------
@@ -980,7 +2244,7 @@ function diffSide(parts, side) {
     .map(p => (p.op === "eq" || p.ws) ? p.text : h("span", { class: "d-" + p.op }, p.text));
 }
 
-function responseCompare(o, c, respText, ms) {
+function responseCompare(o, c, respText, ms, labels) {
   const origText = respText(o.response);
   const candOk = c && c.status !== "error";
   const candText = !c ? "—" : (c.status === "error" ? "ERROR: " + (c.error || "unknown") : respText(c.response));
@@ -1033,12 +2297,12 @@ function responseCompare(o, c, respText, ms) {
       h("label", { class: "row", style: "gap:6px;font-size:12px;cursor:pointer", for: toggleId },
         toggle, "Highlight differences"),
       h("span", { class: "row", style: "gap:10px;font-size:11px" },
-        h("span", { class: "d-del" }, "removed from original"),
-        h("span", { class: "d-ins" }, "added by candidate"),
+        h("span", { class: "d-del" }, labels ? `only in ${labels[0]}` : "removed from original"),
+        h("span", { class: "d-ins" }, labels ? `only in ${labels[1]}` : "added by candidate"),
         stats)),
     h("div", { class: "grid cols-2" },
-      h("div", {}, head("Original response", origSub), origPane),
-      h("div", {}, head("Candidate response", candSub), candPane)));
+      h("div", {}, head(labels ? labels[0] : "Original response", origSub), origPane),
+      h("div", {}, head(labels ? labels[1] : "Candidate response", candSub), candPane)));
 }
 responseCompare.seq = 0;
 
@@ -1062,28 +2326,43 @@ function dimBars(avgs) {
   return h("div", { class: "dimbars" }, ...rows);
 }
 
-// D1–D6 × candidate table; highlights the best candidate per dimension.
-function dimBreakdown(cands) {
+// D1–D6 × candidate table; highlights the best candidate per dimension, and labels the
+// columns of the models the recommendation picked (Best overall / quality / economical / latency).
+function dimBreakdown(cands, rec) {
   const dims = DIMENSIONS.filter(d => cands.some(v => typeof (v.dimension_averages || {})[d.key] === "number"));
   if (!dims.length || !cands.length) return null;
-  const head = h("tr", {}, h("th", {}, "Dimension"), ...cands.map(v => h("th", { class: "mono" }, v.model)));
-  const body = dims.map(d => {
+  const order = ["best_overall", "best_quality", "most_economical", "lowest_latency"];
+  const picks = cands.map(v => picksFor(rec, v.model).sort((a, b) => order.indexOf(a) - order.indexOf(b)));
+  const colCls = (i) => !picks[i].length ? "" : (picks[i].includes("best_overall") ? "pickcol bo" : "pickcol");
+  const head = h("tr", {}, h("th", {}, "Dimension"), ...cands.map((v, i) => h("th", { class: ("mono " + colCls(i)).trim() },
+    v.model,
+    picks[i].length ? h("div", { class: "colpicks" },
+      ...picks[i].map(k => h("span", { class: "chip" + (k === "best_overall" ? " pick" : ""), title: PROFILE_TEXT[k] }, PROFILE_CHIP[k]))) : null)));
+  const body = dims.map((d, ri) => {
     const vals = cands.map(v => (v.dimension_averages || {})[d.key]);
     const nums = vals.filter(x => typeof x === "number");
     const best = nums.length > 1 ? Math.max(...nums) : null;
     const spread = nums.length > 1 && Math.max(...nums) - Math.min(...nums) > 0.001;
+    const last = ri === dims.length - 1 ? " last" : "";
     return h("tr", { class: "static" },
       h("td", { title: d.desc },
         h("b", {}, d.code), " " + d.name,
         d.hard ? h("span", { class: "hardtag", title: "A failure here caps the verdict at Incompatible" }, "hard-break") : null),
-      ...vals.map(x => typeof x !== "number"
-        ? h("td", { class: "muted" }, "—")
-        : h("td", {}, h("div", { class: "dimcell" },
-            miniBar(x),
-            h("span", { class: "tnum dimval", style: `color:${scoreColor(x)}` }, x.toFixed(2)),
-            (spread && x === best) ? h("span", { class: "bestmark", title: "Best on this dimension" }, "▲") : null))));
+      ...vals.map((x, i) => typeof x !== "number"
+        ? h("td", { class: ("muted heat " + colCls(i) + (colCls(i) ? last : "")).trim() }, "—")
+        : h("td", { class: ("heat " + colCls(i) + (colCls(i) ? last : "")).trim() }, h("div", { class: "heatcell tnum", style: `background:${heatBg(x)}`,
+            title: `${d.name}: ${x.toFixed(2)}` + ((spread && x === best) ? " (best)" : "") },
+            x.toFixed(2), (spread && x === best) ? h("span", { class: "bestmark", title: "Best on this dimension" }, BEST_ICON) : null))));
   });
-  return h("table", { class: "breakdown" }, h("thead", {}, head), h("tbody", {}, ...body));
+  return h("table", { class: "breakdown heatmap" }, h("thead", {}, head), h("tbody", {}, ...body));
+}
+
+// Heatmap tile colour: same thresholds as scoreColor (≥0.85 good, ≥0.60 watch, else poor),
+// stronger tint the further into the band.
+function heatBg(v) {
+  if (v >= 0.85) return `rgba(52,211,153,${(0.22 + 0.5 * Math.min(1, (v - 0.85) / 0.15)).toFixed(2)})`;
+  if (v >= 0.6) return `rgba(245,181,68,${(0.22 + 0.4 * Math.min(1, (v - 0.6) / 0.25)).toFixed(2)})`;
+  return "rgba(244,104,95,.55)";
 }
 
 function scoresBlock(sc) {
@@ -1096,11 +2375,12 @@ function scoresBlock(sc) {
     // overall label + what it means
     h("div", { class: "row", style: "gap:8px;align-items:center;margin-bottom:6px" },
       h("span", { class: "pill " + label }, LABEL_TEXT[label] || "—"),
-      h("span", { class: "muted", style: "font-size:12px" }, LABEL_EXPLAIN[label] || "")),
-    sc.hard_break
-      ? h("div", { class: "banner err", style: "margin:6px 0;font-size:12px" },
-          "Hard break — a broken format, diverged fact, or mismatched tool call caps this at Incompatible regardless of the other scores.")
-      : null);
+      h("span", { class: "muted", style: "font-size:12px" }, LABEL_EXPLAIN[label] || "")));
+  // Native append prints null as the text "null": add the hard-break banner only when there is one.
+  if (sc.hard_break) {
+    wrap.append(h("div", { class: "banner err", style: "margin:6px 0;font-size:12px" },
+      "Hard break — a broken format, diverged fact, or mismatched tool call caps this at Incompatible regardless of the other scores."));
+  }
 
   const rows = DIMENSIONS.map(dim => {
     const d = sc[dim.key];
@@ -1192,7 +2472,11 @@ async function loadRemediations(el, runId, model) {
     ...rems.map(r => remediationCard(runId, r)));
 }
 
-const EFFORTS = ["minimal", "low", "medium", "high"];
+const EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh"];
+// Efforts a model accepts (from /models; probed live against Bedrock). Unknown models: all.
+const baseModel = (m) => String(m || "").split("@")[0];
+const effortsFor = (m) => (MODELS?.models?.[baseModel(m)]?.reasoning_efforts) || EFFORTS;
+const effortApplies = (m) => MODELS?.models?.[baseModel(m)]?.effort_applies !== false;
 const REM_TYPE_TEXT = { prompt_edit: "Prompt instruction", format_schema: "Format instruction", reasoning_effort: "Reasoning effort" };
 
 function remediationCard(runId, rem) {
@@ -1224,8 +2508,10 @@ function remediationCard(runId, rem) {
     h("option", { value: "append" }, "Append to system prompt"), h("option", { value: "prepend" }, "Prepend to system prompt"));
   placeSel.value = draft.placement;
   placeSel.addEventListener("change", () => { draft.placement = placeSel.value; scheduleEstimate(); });
+  const remEfforts = effortsFor(rem.candidate);
+  if (!remEfforts.includes(draft.effort)) draft.effort = remEfforts.includes("low") ? "low" : remEfforts[0];
   const effortSel = h("select", { style: "width:auto", "aria-label": "Reasoning effort to test" },
-    ...EFFORTS.map(e => h("option", { value: e }, e)));
+    ...remEfforts.map(e => h("option", { value: e }, e)));
   effortSel.value = draft.effort;
   effortSel.addEventListener("change", () => { draft.effort = effortSel.value; scheduleEstimate(); });
   const instrBox = h("div", {}, instrArea,
@@ -1386,7 +2672,7 @@ function remediationPatch(rem, draft) {
     const eff = validated ? validated.after : draft.effort;
     lines.push("", `# Set the request parameter for ${rem.candidate}:`, `reasoning_effort: ${eff}`,
       "", "# LiteLLM proxy config (config.yaml), if the parameter is set at the gateway:",
-      "model_list:", `  - model_name: ${rem.candidate}`, "    litellm_params:", "      # ...existing params...",
+      "model_list:", `  - model_name: ${String(rem.candidate || "").split("@")[0]}`, "    litellm_params:", "      # ...existing params...",
       `      reasoning_effort: ${eff}`);
   } else {
     const text = validated ? validated.after : draft.instr;
@@ -1517,11 +2803,33 @@ async function renderSettings(main) {
   const draft = { price_table: {} };
 
   // Defaults form
-  const effortSeg = h("div", { class: "seg" }, ...["minimal", "low", "medium", "high"].map(x =>
+  const effortSeg = h("div", { class: "seg" }, ...["none", "low", "medium", "high", "xhigh"].map(x =>
     h("button", { class: x === s.default_reasoning_effort ? "active" : "",
       onclick: () => { draft.default_reasoning_effort = x; effortSeg.querySelectorAll("button").forEach(b => b.classList.toggle("active", b.textContent === x)); } }, x)));
   const judgeInput = h("input", { type: "text", value: s.judge_model, oninput: e => draft.judge_model = e.target.value });
-  const parInput = h("input", { type: "text", value: String(s.parallelism), oninput: e => draft.parallelism = parseInt(e.target.value, 10) });
+  const cc = s.concurrency || {};
+  const parInput = h("input", { type: "number", min: "1", max: String(cc.max_parallelism || 16), step: "1",
+    value: String(s.parallelism), style: "width:90px", "aria-describedby": "parHelp",
+    oninput: e => draft.parallelism = parseInt(e.target.value, 10) });
+  const adaptBox = h("input", { type: "checkbox", id: "adaptConc", checked: cc.adaptive_concurrency !== false,
+    onchange: e => { draft.adaptive_concurrency = e.target.checked; } });
+  const capInput = h("input", { type: "number", min: "1", max: "64", step: "1", value: String(cc.max_inflight_calls ?? 16),
+    style: "width:90px", oninput: e => draft.max_inflight_calls = parseInt(e.target.value, 10) });
+  const ffInput = h("input", { type: "number", min: "5", max: "100", step: "5", placeholder: "off", style: "width:90px",
+    value: cc.fail_fast_error_share == null ? "" : String(Math.round(cc.fail_fast_error_share * 100)),
+    oninput: e => { const n = parseFloat(e.target.value); draft.fail_fast_error_share = Number.isFinite(n) ? n / 100 : null; } });
+  const concurrencyBlock = h("div", { class: "field", style: "margin-top:4px" },
+    h("div", { style: "font-weight:600;margin-bottom:6px" }, "Parallel calls"),
+    h("div", { class: "grid cols-2" },
+      h("label", { class: "field" }, h("span", {}, `Parallel calls per run (1–${cc.max_parallelism || 16})`), parInput,
+        h("div", { id: "parHelp", class: "muted", style: "font-size:11px;margin-top:4px" },
+          "How many model calls are sent at the same time. Higher is faster but more likely to hit Bedrock throttling; ModelShift slows down automatically if it does. Copied into each run when it starts.")),
+      h("label", { class: "field" }, h("span", {}, "Max calls in flight across all runs"), capInput,
+        h("div", { class: "muted", style: "font-size:11px;margin-top:4px" }, "A server-wide cap: when several runs are live they share it."))),
+    h("div", { class: "grid cols-2" },
+      h("label", { class: "row", style: "gap:8px;cursor:pointer", for: "adaptConc" }, adaptBox,
+        h("span", {}, "Slow down automatically when throttled, and speed back up")),
+      h("label", { class: "field" }, h("span", {}, "Stop a run early when this % of the last 20 calls fail with the same error (blank = off)"), ffInput)));
   const smallInput = h("input", { type: "text", value: String(s.small_sample_threshold), oninput: e => draft.small_sample_threshold = parseInt(e.target.value, 10) });
   const redInput = h("input", { type: "text", value: String(s.high_redaction_threshold), oninput: e => draft.high_redaction_threshold = parseFloat(e.target.value) });
 
@@ -1580,12 +2888,50 @@ async function renderSettings(main) {
   });
 
   const saveMsg = h("span", { class: "muted", style: "margin-left:12px" }, "");
+
+  // Recommendation (quality gate, tolerance, latency metric, preset weights).
+  const rs = s.recommendation || {};
+  const recDraft = {};
+  const numIn = (key, scale, width = "90px") => h("input", { type: "number", step: "any",
+    value: rs[key] == null ? "" : String(+(rs[key] * scale).toFixed(4)), style: `width:${width}`,
+    oninput: e => { const n = parseFloat(e.target.value); if (Number.isFinite(n)) recDraft[key] = n / scale; else delete recDraft[key]; } });
+  // Optional gate: leaving it blank switches the gate off (saved as null).
+  const optIn = (key, scale, placeholder) => h("input", { type: "number", step: "any", placeholder,
+    value: rs[key] == null ? "" : String(+(rs[key] * scale).toFixed(4)), style: "width:90px",
+    oninput: e => { const n = parseFloat(e.target.value); recDraft[key] = Number.isFinite(n) ? n / scale : null; } });
+  const latSeg = h("div", { class: "seg" }, ...[["per_token", "ms per output token"], ["p50", "median end-to-end"]].map(([k, t]) =>
+    h("button", { class: (rs.latency_metric || "per_token") === k ? "active" : "",
+      onclick: () => { recDraft.latency_metric = k; latSeg.querySelectorAll("button").forEach((b, i) => b.classList.toggle("active", i === (k === "p50" ? 1 : 0))); } }, t)));
+  const tieBox = h("input", { type: "checkbox", id: "statTies", checked: rs.statistical_ties !== false,
+    onchange: e => { recDraft.statistical_ties = e.target.checked; } });
+  const presetRows = Object.entries(rs.weight_presets || {}).map(([name, w]) => {
+    const cell = (axis) => h("input", { type: "number", step: "0.05", min: "0", value: String(w[axis]), style: "width:80px",
+      oninput: e => {
+        const n = parseFloat(e.target.value);
+        recDraft.weight_presets = recDraft.weight_presets || JSON.parse(JSON.stringify(rs.weight_presets));
+        if (Number.isFinite(n)) recDraft.weight_presets[name][axis] = n;
+      } });
+    const label = (PRESETS.find(p => p[0] === name) || [name, name])[1];
+    return h("tr", {}, h("td", {}, label), h("td", {}, cell("quality")), h("td", {}, cell("cost")), h("td", {}, cell("latency")));
+  });
+  const missingPrice = h("div", { class: "muted", style: "font-size:12px;margin-top:8px" });
+  (async () => {
+    try {
+      const m = await api("/models");
+      const missing = Object.keys(m.models || {}).filter(k => !(k in (s.price_table || {})));
+      missingPrice.textContent = missing.length
+        ? `No price configured for: ${missing.join(", ")}. Their cost shows as "Price not configured" and they are left out of cost ranking — add a row below.`
+        : "Every catalog model has a price.";
+    } catch (e) { missingPrice.textContent = ""; }
+  })();
+
   const save = async () => {
     saveMsg.textContent = "Saving…";
     try {
       const body = { ...draft };
+      if (Object.keys(recDraft).length) body.recommendation = recDraft;
       // only send changed scalar fields that are valid numbers
-      ["parallelism", "small_sample_threshold"].forEach(k => { if (Number.isNaN(body[k])) delete body[k]; });
+      ["parallelism", "small_sample_threshold", "max_inflight_calls"].forEach(k => { if (Number.isNaN(body[k])) delete body[k]; });
       if (Number.isNaN(body.high_redaction_threshold)) delete body.high_redaction_threshold;
       SETTINGS = await api("/settings", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
       saveMsg.textContent = "Saved ✓";
@@ -1597,8 +2943,8 @@ async function renderSettings(main) {
     h("div", { class: "card" },
       h("h3", {}, "Run defaults"),
       h("div", { class: "grid cols-2" },
-        h("label", { class: "field" }, h("span", {}, "Default reasoning effort"), effortSeg),
-        h("label", { class: "field" }, h("span", {}, "Concurrency (parallel calls)"), parInput)),
+        h("label", { class: "field" }, h("span", {}, "Default reasoning effort"), effortSeg)),
+      concurrencyBlock,
       h("label", { class: "field" }, h("span", {}, "Judge model — direct Bedrock (inference-profile id; used when endpoint is Bedrock)"), judgeInput),
       h("div", { class: "grid cols-2" },
         h("label", { class: "field" }, h("span", {}, "Small-sample caveat threshold (evaluable rows)"), smallInput),
@@ -1611,7 +2957,42 @@ async function renderSettings(main) {
       h("label", { class: "field" }, h("span", {}, s.litellm_key_set ? "API key (a key is set)" : "API key"), llKeyInput),
       h("label", { class: "field" }, h("span", {}, "Judge model — LiteLLM path (pick from your proxy's models; used when endpoint is LiteLLM)"), llJudgeInput)),
     h("div", { class: "card" },
+      h("h3", {}, "Recommendation"),
+      h("div", { class: "muted", style: "margin:-4px 0 10px" },
+        "Only candidates that pass every quality gate can be recommended. Changes apply to past runs too (results are re-ranked, no model calls)."),
+      h("div", { class: "grid cols-2" },
+        h("label", { class: "field" }, h("span", {}, "Minimum Migration Confidence (0–100)"), numIn("min_confidence", 1)),
+        h("label", { class: "field" }, h("span", {}, "Maximum hard-break rate (%)"), numIn("max_hard_break_rate", 100))),
+      h("div", { class: "grid cols-2" },
+        h("label", { class: "field" }, h("span", {}, "Maximum error rate (%)"), numIn("max_error_rate", 100)),
+        h("label", { class: "field" }, h("span", {}, "Quality window for the economical / latency / overall picks (confidence points below the best)"), numIn("quality_tolerance", 1))),
+      h("div", { class: "grid cols-2" },
+        h("label", { class: "field" }, h("span", {}, "Minimum timed calls before latency counts"), numIn("min_latency_samples", 1)),
+        h("label", { class: "field" }, h("span", {}, "Latency measure used for ranking"), latSeg)),
+      h("label", { class: "row", style: "gap:8px;align-items:flex-start;margin:6px 0 4px", for: "statTies" }, tieBox,
+        h("span", {}, "Treat statistically tied quality as equal",
+          h("div", { class: "muted", style: "font-size:12px" },
+            "When a candidate's confidence can't be separated from the best (95% bootstrap interval of the difference "
+            + "includes 0), it gets the full quality score, so cost and latency decide between them. Applies inside the quality window only."))),
+      h("div", { class: "muted", style: "margin:10px 0 6px;font-weight:600" }, "Replays and consistency (D7)"),
+      h("div", { class: "grid cols-2" },
+        h("label", { class: "field" }, h("span", {}, "Default times to send each request when replays are on (2–5)"), numIn("default_replays", 1)),
+        h("label", { class: "field" }, h("span", {}, "Warn before launch above this many calls"), numIn("replay_call_ceiling", 1))),
+      h("div", { class: "grid cols-2" },
+        h("label", { class: "field" }, h("span", {}, "Unstable below this consistency (0–1)"), numIn("instability_threshold", 1)),
+        h("label", { class: "field" }, h("span", {}, "Gate: minimum consistency (0–1, blank = off)"), optIn("min_consistency", 1, "off"))),
+      h("div", { class: "grid cols-2" },
+        h("label", { class: "field" }, h("span", {}, "Gate: maximum flip rate (%, blank = off) — requests where some answers hard-break and some don't"), optIn("max_flip_rate", 100, "off")),
+        h("div", { class: "muted", style: "font-size:11px;align-self:center" },
+          "Consistency never changes Migration Confidence or labels; these gates only decide whether a model can be recommended.")),
+      h("div", { class: "muted", style: "margin:6px 0" }, "Preset weights (relative; normalised to 100%, quality never below 20%)"),
+      h("table", {}, h("thead", {}, h("tr", {}, ...["Preset", "Quality", "Cost", "Latency"].map(t => h("th", { scope: "col" }, t)))),
+        h("tbody", {}, ...presetRows))),
+    h("div", { class: "card" },
       h("h3", {}, "Price table (USD per 1K tokens)"),
+      h("div", { class: "muted", style: "margin:-4px 0 6px;font-size:12px" },
+        "Public Amazon Bedrock list prices (Standard tier, short context). Reasoning tokens bill at the output rate; prompt caching is not modelled."),
+      missingPrice,
       h("table", {}, h("thead", {}, h("tr", {}, ...["Model", "Input /1K", "Output /1K"].map(t => h("th", {}, t)))),
         h("tbody", {}, ...priceRows))),
     h("div", { class: "row", style: "margin-top:16px" },

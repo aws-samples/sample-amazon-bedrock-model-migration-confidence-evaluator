@@ -15,10 +15,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Protocol
 
-from .config import MODEL_CATALOG, estimate_cost
+from . import resilience as _resilience
+from .config import MODEL_CATALOG, base_model, estimate_cost
 from .schemas import (
     CallPath,
     CandidateOutput,
@@ -34,7 +36,8 @@ from .schemas import (
 UNSUPPORTED_PARAMS = {"temperature", "top_p", "presence_penalty", "frequency_penalty"}
 
 
-def cache_key(sample: NormalizedSample, model: str, settings: CandidateSettings) -> str:
+def cache_key(sample: NormalizedSample, model: str, settings: CandidateSettings,
+              replay_index: int = 0) -> str:
     prompt = json.dumps(
         {
             "instructions": sample.request.instructions,
@@ -43,6 +46,10 @@ def cache_key(sample: NormalizedSample, model: str, settings: CandidateSettings)
         sort_keys=True,
     )
     raw = f"{sample.id}|{model}|{settings.reasoning_effort.value}|{prompt}"
+    if replay_index > 0:
+        # Each replay is a real, separate call: never answer it from another replay's cache.
+        # Replay 0 keeps the original key so existing caches and results are unchanged.
+        raw += f"|r{replay_index}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
@@ -192,8 +199,7 @@ def _is_unsupported_param_error(exc: Exception) -> bool:
 
 
 def _is_throttle_error(exc: Exception) -> bool:
-    msg = str(exc).lower()
-    return "throttl" in msg or "toomanyrequests" in msg or "rate exceeded" in msg or "429" in msg
+    return _resilience.is_throttle(exc)
 
 
 # --------------------------------------------------------------------------- #
@@ -205,10 +211,30 @@ class CandidateAdapter:
     call_path: CallPath
 
     def __init__(self, transport: Transport, max_retries: int = 3, sleep: Callable[[float], None] = time.sleep):
+        from .concurrency import SingleFlight
         self._transport = transport
         self._max_retries = max_retries
         self._sleep = sleep
-        self._cache: Dict[str, CandidateResult] = {}
+        # Thread-safe result cache: concurrent workers asking for the same call wait for the
+        # first one instead of sending it twice (parallel-calls R2.2).
+        self._flight: "SingleFlight[CandidateResult]" = SingleFlight()
+        self._cache: Dict[str, CandidateResult] = self._flight.store
+        # Fallback observer, called as on_retry(next_attempt, max_attempts, reason, error) before
+        # each back-off sleep. Prefer the per-call ``on_retry`` argument of generate(): this shared
+        # attribute is only safe when one call runs at a time.
+        self.on_retry: Optional[Callable[[int, int, str, str], None]] = None
+
+    def _notify_retry(self, attempt: int, reason: str, exc: Exception,
+                      wait_s: float = 0.0, cb: Optional[Callable[..., None]] = None,
+                      max_attempts: Optional[int] = None) -> None:
+        mx = max_attempts or self._max_retries + 1
+        try:
+            if cb is not None:
+                cb(attempt + 2, mx, reason, str(exc)[:200], wait_s)
+            elif self.on_retry is not None:
+                self.on_retry(attempt + 2, mx, reason, str(exc)[:200])
+        except Exception:  # noqa: BLE001 — an observer must never break a call
+            pass
 
     def _model_ref(self, model: str) -> str:
         raise NotImplementedError
@@ -217,28 +243,43 @@ class CandidateAdapter:
                  sample: NormalizedSample,
                  model: str,
                  settings: Optional[CandidateSettings] = None,
-                 extra_params: Optional[Dict[str, Any]] = None) -> CandidateResult:
+                 extra_params: Optional[Dict[str, Any]] = None,
+                 replay_index: int = 0,
+                 on_retry: Optional[Callable[..., None]] = None) -> CandidateResult:
+        """``on_retry(next_attempt, max_attempts, reason, error, wait_s)`` is called before each
+        back-off sleep of THIS call (safe with concurrent calls)."""
         settings = settings or CandidateSettings()
-        key = cache_key(sample, model, settings)
-        if key in self._cache:
-            return self._cache[key]
+        key = cache_key(sample, model, settings, replay_index)
+        result, cached = self._flight.get_or_compute(
+            key, lambda: self._generate_uncached(sample, model, settings, extra_params,
+                                                 replay_index, key, on_retry))
+        if cached:
+            # A copy flagged from_cache: its latency was measured by an earlier call, so
+            # aggregation must not count it as a fresh timing.
+            return result.model_copy(update={"from_cache": True, "replay_index": replay_index})
+        return result
 
+    def _generate_uncached(self, sample: NormalizedSample, model: str, settings: CandidateSettings,
+                           extra_params: Optional[Dict[str, Any]], replay_index: int, key: str,
+                           on_retry: Optional[Callable[..., None]]) -> CandidateResult:
         model_ref = self._model_ref(model)
         payload = render_responses_payload(sample, model_ref, settings, extra_params)
         dropped_params: List[str] = list(payload.pop("__dropped_params__", []))
         if not _has_usable_input(payload):
-            result = CandidateResult(
+            return CandidateResult(
                 sample_id=sample.id, model=model, settings=settings,
-                status="error", error="no usable prompt text", cache_key=key,
+                status="error", error="no usable prompt text", cache_key=key, replay_index=replay_index,
             )
-            self._cache[key] = result
-            return result
 
         attempt = 0
-        started = time.time()
+        call_started = time.time()
         while True:
+            # Time each attempt on its own: back-off sleeps between retries happen OUTSIDE
+            # this window, so latency_ms is the duration of the call that produced the result.
+            started = time.time()
             try:
                 resp = self._transport(payload)
+                latency_ms = int((time.time() - started) * 1000)
                 output = _parse_responses_output(resp)
                 usage = _usage_from_responses(resp)
                 cost = estimate_cost(
@@ -247,34 +288,34 @@ class CandidateAdapter:
                     usage.completion_tokens or 0,
                     usage.reasoning_tokens or 0,
                 )
-                result = CandidateResult(
+                return CandidateResult(
                     sample_id=sample.id, model=model,
                     settings=CandidateSettings(reasoning_effort=settings.reasoning_effort,
                                                dropped_params=dropped_params),
-                    output=output, usage=usage, cost_estimate=cost,
-                    latency_ms=int((time.time() - started) * 1000),
-                    status="ok", cache_key=key,
+                    output=output, usage=usage,
+                    cost_estimate=cost or 0.0, cost_known=cost is not None,
+                    latency_ms=latency_ms, attempts=attempt + 1,
+                    status="ok", cache_key=key, replay_index=replay_index,
                 )
-                self._cache[key] = result
-                return result
             except Exception as exc:  # noqa: BLE001 — deliberate: classify & retry
-                if _is_throttle_error(exc) and attempt < self._max_retries:
-                    self._sleep(min(2 ** attempt, 8))
+                failed_ms = int((time.time() - started) * 1000)
+                # A param the model rejects will be rejected again; everything else follows the
+                # shared policy (modelshift/resilience.py): retry only transient failures, with
+                # jittered exponential back-off, a single retry for timeouts, and a per-call deadline.
+                plan = None if _is_unsupported_param_error(exc) else _resilience.decide(
+                    exc, attempt, self._max_retries, time.time() - call_started)
+                if plan is not None:
+                    self._notify_retry(attempt, plan.reason, exc, plan.wait_s, on_retry, plan.max_attempts)
+                    self._sleep(plan.wait_s)
                     attempt += 1
                     continue
-                if attempt < self._max_retries and not _is_unsupported_param_error(exc):
-                    self._sleep(min(2 ** attempt, 8))
-                    attempt += 1
-                    continue
-                result = CandidateResult(
+                return CandidateResult(
                     sample_id=sample.id, model=model,
                     settings=CandidateSettings(reasoning_effort=settings.reasoning_effort,
                                                dropped_params=dropped_params),
                     status="error", error=str(exc),
-                    latency_ms=int((time.time() - started) * 1000), cache_key=key,
+                    latency_ms=failed_ms, attempts=attempt + 1, cache_key=key, replay_index=replay_index,
                 )
-                self._cache[key] = result
-                return result
 
 
 class BedrockResponsesAdapter(CandidateAdapter):
@@ -285,9 +326,11 @@ class BedrockResponsesAdapter(CandidateAdapter):
         self._endpoint = endpoint  # "runtime" | "mantle"
 
     def _model_ref(self, model: str) -> str:
-        entry = MODEL_CATALOG.get(model)
+        entry = MODEL_CATALOG.get(base_model(model))
         if not entry:
-            return model
+            from .discovery import get as _discovered
+            dm = _discovered(model)
+            return dm.model_id if dm else base_model(model)
         return entry.mantle_model_id if self._endpoint == "mantle" else entry.bedrock_model_id
 
 
@@ -295,8 +338,12 @@ class LiteLLMResponsesAdapter(CandidateAdapter):
     call_path = CallPath.LITELLM
 
     def _model_ref(self, model: str) -> str:
-        entry = MODEL_CATALOG.get(model)
-        return entry.litellm_model_group if entry else model
+        entry = MODEL_CATALOG.get(base_model(model))
+        if entry:
+            return entry.litellm_model_group
+        from .discovery import get as _discovered
+        dm = _discovered(model)
+        return dm.model_id if dm else base_model(model)
 
 
 def make_bedrock_converse_transport(region: str = "us-east-1") -> Transport:
@@ -306,9 +353,7 @@ def make_bedrock_converse_transport(region: str = "us-east-1") -> Transport:
     request, then maps the Converse response back into the OpenAI-ish
     {choices:[{message:{content}}], usage:{...}} shape the parser understands.
     """
-    import boto3  # lazy
-
-    client = boto3.client("bedrock-runtime", region_name=region)
+    client = _boto_client(region)
 
     def _invoke(payload: Dict[str, Any]) -> Dict[str, Any]:
         system = [{"text": payload["instructions"]}] if payload.get("instructions") else []
@@ -335,17 +380,24 @@ def make_bedrock_converse_transport(region: str = "us-east-1") -> Transport:
     return _invoke
 
 
+def _chat_url(base: str, endpoint: str, model_id: str) -> str:
+    """Chat Completions URL. Mantle serves OpenAI models under /openai/v1 and every other
+    provider under its generic /v1 route (verified live us-east-1, 2026-11-13)."""
+    if endpoint == "mantle" and not str(model_id).startswith("openai."):
+        return base.replace("/openai/v1", "/v1") + "/chat/completions"
+    return f"{base}/chat/completions"
+
+
 def make_bedrock_sigv4_transport(region: str = "us-east-1", endpoint: str = "runtime") -> Transport:
     """Bedrock OpenAI-compatible /openai/v1 transport signed with SigV4 using the
     machine's local AWS credentials (default provider chain) — NO API key needed.
 
     endpoint="runtime": https://bedrock-runtime.{region}.amazonaws.com/openai/v1
-                        (Luna/Terra/Sol via us.openai.* profile ids)
+                        (Luna/Terra/Sol/GPT-5.4 via us.openai.* profile ids)
     endpoint="mantle":  https://bedrock-mantle.{region}.api.aws/openai/v1
-                        (required for GPT-5.4 → openai.gpt-5.4)
+                        (openai.* ids, e.g. openai.gpt-5.4)
     """
     import boto3  # lazy
-    import httpx
     from botocore.auth import SigV4Auth
     from botocore.awsrequest import AWSRequest
 
@@ -354,23 +406,52 @@ def make_bedrock_sigv4_transport(region: str = "us-east-1", endpoint: str = "run
     else:
         base = f"https://bedrock-runtime.{region}.amazonaws.com/openai/v1"
     session = boto3.Session()
+    creds_src = session.get_credentials()
+    creds_lock = threading.Lock()
+    client = _shared_http_client()
 
     def _invoke(payload: Dict[str, Any]) -> Dict[str, Any]:
         body = to_chat_completions_body(payload)
         body["model"] = payload["model"]
         data = json.dumps(body)
-        url = f"{base}/chat/completions"
-        creds = session.get_credentials().get_frozen_credentials()
+        url = _chat_url(base, endpoint, payload["model"])
+        with creds_lock:  # boto3 Session isn't documented as thread-safe; refresh one at a time
+            creds = creds_src.get_frozen_credentials()
         aws_req = AWSRequest(method="POST", url=url, data=data,
                              headers={"Content-Type": "application/json"})
         SigV4Auth(creds, "bedrock", region).add_auth(aws_req)
-        with httpx.Client(timeout=120) as client:
-            r = client.post(url, content=data, headers=dict(aws_req.headers))
-            if r.status_code >= 400:
-                raise RuntimeError(f"{r.status_code} from {url}: {r.text[:400]}")
-            return r.json()
+        r = client.post(url, content=data, headers=dict(aws_req.headers))
+        if r.status_code >= 400:
+            raise RuntimeError(f"{r.status_code} from {url}: {r.text[:400]}")
+        return r.json()
 
     return _invoke
+
+
+def make_bedrock_sigv4_model_lister(region: str = "us-east-1", endpoint: str = "mantle") -> Callable[[], List[str]]:
+    """GET {base}/models on the Bedrock OpenAI-compatible endpoint, SigV4-signed with the
+    machine's AWS credentials. Returns the model ids it lists."""
+    import boto3  # lazy
+    from botocore.auth import SigV4Auth
+    from botocore.awsrequest import AWSRequest
+
+    # Mantle lists models at /v1/models (its /openai/v1 prefix serves chat only).
+    base = (f"https://bedrock-mantle.{region}.api.aws/v1" if endpoint == "mantle"
+            else f"https://bedrock-runtime.{region}.amazonaws.com/openai/v1")
+    creds_src = boto3.Session().get_credentials()
+
+    def _list() -> List[str]:
+        if creds_src is None:
+            raise RuntimeError("no AWS credentials available to sign the request")
+        url = f"{base}/models"
+        aws_req = AWSRequest(method="GET", url=url)
+        SigV4Auth(creds_src.get_frozen_credentials(), "bedrock", region).add_auth(aws_req)
+        r = _shared_http_client().get(url, headers=dict(aws_req.headers))
+        if r.status_code >= 400:
+            raise RuntimeError(f"{r.status_code} from {url}: {r.text[:200]}")
+        return [m.get("id") for m in (r.json().get("data") or []) if isinstance(m, dict) and m.get("id")]
+
+    return _list
 
 
 def make_bedrock_transport(region: str = "us-east-1") -> Transport:
@@ -379,11 +460,9 @@ def make_bedrock_transport(region: str = "us-east-1") -> Transport:
     Bedrock's GPT-5.6 invoke_model uses the Chat Completions body shape
     (validated live). We convert the internal canonical payload accordingly.
     Note: the AWS-recommended path is the /openai/v1 endpoint — see
-    make_bedrock_openai_transport. invoke_model does NOT work for GPT-5.4 (mantle-only).
+    make_bedrock_openai_transport.
     """
-    import boto3  # lazy
-
-    client = boto3.client("bedrock-runtime", region_name=region)
+    client = _boto_client(region)
 
     def _invoke(payload: Dict[str, Any]) -> Dict[str, Any]:
         body = to_chat_completions_body(payload)
@@ -403,48 +482,80 @@ def make_bedrock_openai_transport(api_key: str, region: str = "us-east-1",
     """Bedrock OpenAI-compatible /openai/v1 Chat Completions transport (Bearer key).
 
     endpoint="runtime": https://bedrock-runtime.{region}.amazonaws.com/openai/v1
-                        (Luna/Terra/Sol via us.openai.* profile ids)
+                        (Luna/Terra/Sol/GPT-5.4 via us.openai.* profile ids)
     endpoint="mantle":  https://bedrock-mantle.{region}.api.aws/openai/v1
-                        (required for GPT-5.4 → openai.gpt-5.4)
+                        (openai.* ids, e.g. openai.gpt-5.4)
     """
-    import httpx  # lazy
-
     if endpoint == "mantle":
         base = f"https://bedrock-mantle.{region}.api.aws/openai/v1"
     else:
         base = f"https://bedrock-runtime.{region}.amazonaws.com/openai/v1"
 
+    client = _shared_http_client()
+
     def _invoke(payload: Dict[str, Any]) -> Dict[str, Any]:
         body = to_chat_completions_body(payload)
         body["model"] = payload["model"]
-        with httpx.Client(timeout=120) as client:
-            r = client.post(f"{base}/chat/completions",
-                            headers={"Authorization": f"Bearer {api_key}"}, json=body)
-            if r.status_code >= 400:
-                raise RuntimeError(f"{r.status_code}: {r.text[:400]}")
-            return r.json()
+        r = client.post(_chat_url(base, endpoint, payload["model"]),
+                        headers={"Authorization": f"Bearer {api_key}"}, json=body)
+        if r.status_code >= 400:
+            raise RuntimeError(f"{r.status_code}: {r.text[:400]}")
+        return r.json()
 
     return _invoke
 
 
 def make_litellm_transport(base_url: str, api_key: str) -> Transport:
     """Real LiteLLM transport via httpx (lazy import) to /v1/chat/completions."""
-    import httpx  # lazy
+    client = _shared_http_client()
 
     def _invoke(payload: Dict[str, Any]) -> Dict[str, Any]:
         body = to_chat_completions_body(payload)
         body["model"] = payload["model"]  # LiteLLM routes by model in the body
-        with httpx.Client(timeout=120) as client:
-            r = client.post(
-                f"{base_url.rstrip('/')}/v1/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}"},
-                json=body,
-            )
-            if r.status_code >= 400:
-                raise RuntimeError(f"{r.status_code}: {r.text[:400]}")
-            return r.json()
+        r = client.post(
+            f"{base_url.rstrip('/')}/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json=body,
+        )
+        if r.status_code >= 400:
+            raise RuntimeError(f"{r.status_code}: {r.text[:400]}")
+        return r.json()
 
     return _invoke
+
+
+_HTTP_CLIENT = None
+_HTTP_LOCK = threading.Lock()
+HTTP_POOL_SIZE = 64
+
+
+def _shared_http_client():
+    """One thread-safe httpx client for all transports: reuses connections so concurrent calls
+    don't pay TLS setup each time (keeps measured latency honest; parallel-calls R8.3)."""
+    global _HTTP_CLIENT
+    import httpx  # lazy
+    with _HTTP_LOCK:
+        if _HTTP_CLIENT is None:
+            # Explicit limits on every phase, so a hung connection fails (and is retried by the
+            # shared policy) instead of waiting indefinitely.
+            _HTTP_CLIENT = httpx.Client(
+                timeout=httpx.Timeout(connect=_resilience.CONNECT_TIMEOUT_S, read=_resilience.CALL_READ_TIMEOUT_S,
+                                      write=30.0, pool=30.0),
+                limits=httpx.Limits(max_connections=HTTP_POOL_SIZE, max_keepalive_connections=HTTP_POOL_SIZE))
+        return _HTTP_CLIENT
+
+
+def _boto_client(region: str):
+    """bedrock-runtime client with a connection pool sized for concurrent calls (botocore's
+    default is 10) and a hard time limit per attempt. botocore's own retries are switched off:
+    ModelShift's retry loop (resilience.py) owns them, so retries are visible in the run and
+    bounded. Low-level boto3 clients are thread-safe."""
+    import boto3  # lazy
+    from botocore.config import Config
+    return boto3.client("bedrock-runtime", region_name=region, config=Config(
+        max_pool_connections=HTTP_POOL_SIZE,
+        connect_timeout=_resilience.CONNECT_TIMEOUT_S, read_timeout=_resilience.CALL_READ_TIMEOUT_S,
+        retries={"mode": "standard", "total_max_attempts": 1}))
 
 
 def discover_litellm_models(base_url: str, api_key: str, timeout: float = 8.0) -> List[str]:
