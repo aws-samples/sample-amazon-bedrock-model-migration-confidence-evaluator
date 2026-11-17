@@ -70,7 +70,9 @@ def test_per_call_retry_observer_gets_wait_and_wins_over_attribute():
     a.on_retry = lambda *x: attr.append(x)
     r = a.generate(_sample(), "gpt-5.6-luna@low", CandidateSettings(), on_retry=lambda *x: per_call.append(x))
     assert r.status == "ok" and attr == []
-    assert [(x[0], x[2], x[4]) for x in per_call] == [(2, "throttled", 1), (3, "throttled", 2)]
+    assert [(x[0], x[2]) for x in per_call] == [(2, "throttled"), (3, "throttled")]
+    # jittered exponential back-off: throttles start at 2 s (half fixed + half random), doubling each retry
+    assert 1.0 <= per_call[0][4] <= 2.0 and 2.0 <= per_call[1][4] <= 4.0
 
 
 def test_judge_cache_is_single_flight():

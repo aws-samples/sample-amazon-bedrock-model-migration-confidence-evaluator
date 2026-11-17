@@ -100,7 +100,7 @@ code, .mono { font-family: var(--mono); }
 /* inputs */
 label.field { display: block; margin-bottom: var(--sp-4); }
 label.field > span { display: block; color: var(--muted); font-size: 12px; margin-bottom: var(--sp-1); }
-input[type=text], select {
+input[type=text], input[type=search], select {
   width: 100%; font: inherit; color: var(--text); background: var(--bg);
   border: 1px solid var(--border); border-radius: var(--radius-sm); padding: var(--sp-2) var(--sp-3);
 }
@@ -207,7 +207,7 @@ table.breakdown .dimcell { display: grid; grid-template-columns: minmax(60px, 1f
   gap: var(--sp-2); align-items: center; }
 .hardtag { margin-left: 6px; font-size: 10px; font-weight: 600; color: var(--bad);
   border: 1px solid rgba(244,104,95,.35); border-radius: 999px; padding: 0 6px; }
-.bestmark { color: var(--ok); font-size: 10px; }
+.bestmark { font-size: 13px; line-height: 1; cursor: help; }
 tr.static:hover td { background: transparent; cursor: default; }
 
 /* remediation editor + re-test results */
@@ -482,6 +482,17 @@ table.heatmap td.heat { padding: 3px 4px; }
 table.heatmap .heatcell { text-align: center; font-weight: 600; color: var(--text); border-radius: 5px; padding: 6px 8px; }
 table.heatmap .heatcell .bestmark { margin-left: 4px; color: var(--text); }
 table.heatmap th.mono { text-align: center; font-weight: 500; }
+/* Recommended-pick columns: tint; Best overall also gets an accent outline. */
+table.heatmap th.pickcol, table.heatmap td.pickcol { background: rgba(79,124,255,.07); }
+table.heatmap th.pickcol { vertical-align: top; }
+table.heatmap th.pickcol.bo, table.heatmap td.pickcol.bo {
+  background: rgba(79,124,255,.13);
+  box-shadow: inset 2px 0 0 var(--accent), inset -2px 0 0 var(--accent);
+}
+table.heatmap th.pickcol.bo { box-shadow: inset 2px 0 0 var(--accent), inset -2px 0 0 var(--accent), inset 0 2px 0 var(--accent); }
+table.heatmap td.pickcol.bo.last { box-shadow: inset 2px 0 0 var(--accent), inset -2px 0 0 var(--accent), inset 0 -2px 0 var(--accent); }
+table.heatmap .colpicks { display: flex; flex-direction: column; align-items: center; gap: 3px; margin-top: 6px; font-family: var(--sans); }
+table.heatmap .colpicks .chip { white-space: nowrap; font-size: 10px; }
 @media (max-width: 1100px) { .rec-grid { grid-template-columns: 1fr; } .hstats { grid-template-columns: 1fr 1fr 1fr; } }
 @media (max-width: 640px) { .hstats { grid-template-columns: 1fr; } .hero-top { flex-direction: column; } }
 
@@ -561,3 +572,49 @@ table.rp-flight tr.boff td { color: var(--partial); }
 details.why-more { margin-top: 6px; font-size: 12px; }
 details.why-more > summary { cursor: pointer; color: var(--accent); }
 details.why-more .why-lines { margin-top: 4px; }
+
+/* Confidence intervals and statistical ties */
+.ringwrap { display: flex; flex-direction: column; align-items: center; gap: 4px; flex: none; }
+.ci-line { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; cursor: help; }
+.metric .ci-line { margin-top: 2px; }
+.tiechip { display: inline-block; margin-left: 6px; padding: 0 6px; border-radius: 999px; font-size: 10px;
+  border: 1px solid var(--accent); color: #c9d6ff; background: rgba(79,124,255,.12); }
+
+/* ---- Candidate picker (Option A) ---- */
+.pk-grid { display: grid; grid-template-columns: 1.15fr 1fr; gap: 18px; align-items: start; }
+@media (max-width: 1000px) { .pk-grid { grid-template-columns: 1fr; } }
+.pk-tray { border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--surface-2); padding: 12px; }
+.pk-trow { display: grid; grid-template-columns: 1fr auto; gap: 6px 10px; padding: 10px 6px; border-bottom: 1px solid var(--border); }
+.pk-trow:last-of-type { border-bottom: 0; }
+.pk-meta { color: var(--muted); font-size: 11px; margin-top: 2px; }
+.pk-x { background: none; border: 0; color: var(--muted); font-size: 16px; cursor: pointer; padding: 0 4px; align-self: start; }
+.pk-x:hover { color: var(--bad); }
+.pk-eff { display: flex; gap: 4px; flex-wrap: wrap; align-items: center; }
+.pk-chip { display: inline-flex; align-items: center; padding: 2px 9px; border-radius: 999px; border: 1px solid var(--border);
+  color: var(--text-dim); font-size: 11px; background: transparent; cursor: pointer; font: inherit; font-size: 11px; }
+.pk-chip.on { border-color: var(--accent); background: rgba(79,124,255,.16); color: #dbe4ff; }
+.pk-chip .n { color: var(--muted); margin-left: 4px; }
+.pk-tag { font-size: 10px; padding: 0 6px; border-radius: 4px; border: 1px solid var(--border); color: var(--muted); margin-left: 2px; }
+.pk-tag.sug { border-color: rgba(52,211,153,.5); color: var(--ok); }
+.pk-tag.warn { border-color: rgba(245,181,68,.5); color: var(--partial); }
+.pk-tag.peer { border-color: rgba(34,211,238,.5); color: var(--drift); }
+.pk-runs { margin-top: 10px; padding-top: 8px; border-top: 1px dashed var(--border); color: var(--muted); font-size: 11px; line-height: 1.6; }
+.pk-browse { border: 1px solid var(--border); border-radius: var(--radius-md); padding: 12px; }
+.pk-search { width: 100%; }
+.pk-provs { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 4px; }
+.pk-list { max-height: 460px; overflow-y: auto; margin-top: 4px; }
+.pk-group { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; margin: 10px 0 4px;
+  display: flex; justify-content: space-between; cursor: default; }
+details.pk-det > summary { cursor: pointer; list-style: none; }
+details.pk-det > summary::-webkit-details-marker { display: none; }
+details.pk-det > summary span:first-child::before { content: "▸ "; }
+details.pk-det[open] > summary span:first-child::before { content: "▾ "; }
+.pk-lrow { display: flex; align-items: center; gap: 10px; padding: 6px 4px; border-radius: 6px; cursor: pointer; }
+.pk-lrow:hover, .pk-lrow:focus-visible { background: var(--surface-2); outline: none; }
+.pk-plus { width: 22px; height: 22px; flex: none; border-radius: 6px; border: 1px solid var(--border);
+  display: inline-flex; align-items: center; justify-content: center; color: var(--text-dim); }
+.pk-plus.done { background: var(--accent); border-color: var(--accent); color: #fff; }
+.pk-live { display: inline-flex; gap: 6px; align-items: center; color: var(--muted); font-size: 11px; }
+.pk-live i { width: 7px; height: 7px; border-radius: 50%; background: var(--ok); display: inline-block; }
+.pk-live i.bad { background: var(--partial); }
+.linkbtn { background: none; border: 0; padding: 0; color: var(--accent); cursor: pointer; font: inherit; font-size: 11px; text-decoration: underline; }

@@ -296,6 +296,11 @@ class CandidateVerdict(BaseModel):
     flip_rate: Optional[float] = None                 # share of requests that both break and don't
     unstable: bool = False                            # mean D7 below the instability threshold
     latency_spread_p50: Optional[float] = None        # median per-request max/min latency ratio
+    # ---- Statistical confidence (request-level bootstrap, modelshift/stats.py; additive) ---- #
+    confidence_ci_low: Optional[float] = None         # 95% interval for migration_confidence
+    confidence_ci_high: Optional[float] = None
+    # Paired 95% interval of (this candidate's confidence - other's), keyed by the other model.
+    quality_diff_ci: Dict[str, List[float]] = Field(default_factory=dict)
 
 
 # --------------------------------------------------------------------------- #
@@ -438,6 +443,10 @@ class CandidateAxes(BaseModel):
     pareto_efficient: bool = False
     dominated_by: Optional[str] = None
     consistency: Optional[float] = None   # mean D7 when replays were on; display only, not in composite
+    quality_ci: Optional[List[float]] = None  # 95% interval of the Migration Confidence
+    # Statistically tied with the best-quality candidate (paired 95% interval of the difference
+    # contains 0). Tied candidates get the full quality_score: the data can't separate them.
+    quality_tied: bool = False
 
 
 class Profile(BaseModel):
@@ -464,6 +473,11 @@ class Recommendation(BaseModel):
     latency_disclaimer: str = ""
     # Short "why this pick" lines per profile kind (and "none" when nobody passed the gate).
     explanations: Dict[str, List[str]] = Field(default_factory=dict)
+    # Statistical ties: models whose quality can't be separated from the best-quality pick
+    # (that pick included). Empty when ties are off or intervals weren't computable.
+    statistical_ties: bool = False
+    confidence_level: float = 0.95
+    quality_ties: List[str] = Field(default_factory=list)
 
     def profile(self, kind: ProfileKind) -> Optional[Profile]:
         return next((p for p in self.profiles if p.kind == kind), None)

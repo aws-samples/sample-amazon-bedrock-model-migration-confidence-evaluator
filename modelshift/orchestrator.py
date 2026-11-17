@@ -45,6 +45,11 @@ def _limiter_key(model: str, adapter: CandidateAdapter) -> str:
     entry = MODEL_CATALOG.get(base_model(model))
     if entry and entry.family == "anthropic":
         return "bedrock-converse"
+    if not entry and adapter.call_path != CallPath.LITELLM:
+        from .discovery import get as _discovered
+        dm = _discovered(model)
+        if dm is not None and dm.family == "converse":
+            return "bedrock-converse"
     return _effective_endpoint(adapter)
 
 
@@ -236,9 +241,12 @@ class Orchestrator:
 
     def _adapter_for(self, cfg: RunConfig, model: str) -> CandidateAdapter:
         entry = MODEL_CATALOG.get(base_model(model))
-        family = entry.family if entry else "openai"
-        # Anthropic (Claude) candidates use the Bedrock Converse transport regardless of call_path.
-        if family == "anthropic":
+        from .discovery import get as _discovered
+        dm = None if entry else _discovered(model)
+        family = entry.family if entry else (dm.family if dm else "openai")
+        # Anthropic (Claude) and every other non-OpenAI provider listed from Bedrock use the
+        # Converse transport (on the LiteLLM path the proxy handles the provider instead).
+        if family == "anthropic" or (family == "converse" and cfg.call_path != CallPath.LITELLM):
             transport = self._converse_transport
             if transport is None:
                 raise RuntimeError(
@@ -260,6 +268,9 @@ class Orchestrator:
         # model — routes to mantle.
         runtime_ok = entry.runtime_supported if entry else True
         use_mantle = (not runtime_ok) or (cfg.bedrock_endpoint == "mantle" and not runtime_ok)
+        if dm is not None:
+            # A model listed live goes to the endpoint it was listed from.
+            use_mantle = dm.endpoint == "mantle"
         if use_mantle:
             transport = self._mantle_transport
             if transport is None:
@@ -501,6 +512,9 @@ class Orchestrator:
                             cancel=cancel, stats=stats, run_id=run.run_id,
                             on_event=lambda t, d: run.emit(t, **d))
 
+            passes_started: set = set()
+            pass_lock = threading.Lock()
+
             def execute(item, ctx):
                 rep_i, c, idx, s = item
                 cid = c.label
@@ -512,6 +526,12 @@ class Orchestrator:
                     ctx.emit("retry", model=cid, sample_id=s.id, index=idx, replay=rep_i,
                              attempt=a, max_attempts=m, reason=why, error=err,
                              wait_s=wait_s, endpoint=ctx.endpoint)
+                if n_rep > 1:
+                    with pass_lock:
+                        first_of_pass = rep_i not in passes_started
+                        passes_started.add(rep_i)
+                    if first_of_pass:
+                        ctx.emit("pass", replay=rep_i, replays=n_rep)
                 ctx.emit("call_start", model=cid, sample_id=s.id, index=idx, replay=rep_i,
                          replays=n_rep, endpoint=ctx.endpoint)
                 result = adapters[cid].generate(s, cid, CandidateSettings(reasoning_effort=c.reasoning_effort),
@@ -560,22 +580,24 @@ class Orchestrator:
                 run.results.sort(key=key)
                 run.pair_scores.sort(key=key)
 
-            # Replays are sent in passes (each pass finishes before the next starts) so a run
-            # cancelled part-way keeps complete passes. Every replay is a real call.
+            # Replays are queued pass by pass (pass 1's calls first), but passes are NOT barriers:
+            # a free slot takes the next queued call even from the next pass, so one slow or
+            # retrying call holds only its own slot. Every replay is a real call. A run cancelled
+            # part-way can therefore hold a partly-sent later pass; consistency (D7) is computed
+            # from whichever answers a request has.
             try:
+                items: List[Any] = []
                 for rep_i in range(n_rep):
-                    if n_rep > 1:
-                        run.emit("pass", replay=rep_i, replays=n_rep)
                     if par == 1:   # today's order: candidate by candidate
-                        items = [(rep_i, c, idx, s) for c in cfg.candidates for idx, s in enumerate(subset)]
+                        items += [(rep_i, c, idx, s) for c in cfg.candidates for idx, s in enumerate(subset)]
                     else:          # interleave candidates so every model progresses together
-                        items = [(rep_i, c, idx, s) for idx, s in enumerate(subset) for c in cfg.candidates]
-                    status = pool.run(items, execute, on_done, endpoint=lambda it: lim_keys[it[1].label])
-                    if status == "cancelled":
-                        _finish_stats()
-                        run.status = RunStatus.CANCELLED
-                        run.emit("cancelled")
-                        return run
+                        items += [(rep_i, c, idx, s) for idx, s in enumerate(subset) for c in cfg.candidates]
+                status = pool.run(items, execute, on_done, endpoint=lambda it: lim_keys[it[1].label])
+                if status == "cancelled":
+                    _finish_stats()
+                    run.status = RunStatus.CANCELLED
+                    run.emit("cancelled")
+                    return run
             except RunAbort as abort:
                 _finish_stats()
                 raise RuntimeError(str(abort))

@@ -65,7 +65,8 @@ def test_each_replay_is_a_real_call_scored_normally(tmp_path, monkeypatch):
     assert v["migration_confidence"] == aggregate(v["model"], run.pair_scores).migration_confidence
     # Events carry the replay number; progress total counts every replay.
     prog = [e.data for e in run.events if e.type == "progress"]
-    assert [p["replay"] for p in prog] == [0, 1, 2] and prog[-1]["total"] == 3
+    # Replays of one request can now run side by side, so completion order isn't fixed.
+    assert sorted(p["replay"] for p in prog) == [0, 1, 2] and prog[-1]["total"] == 3
     # Drill-downs: list carries D7, detail lists every answer, least-consistent endpoint.
     sid = run.samples[0].id
     items = c.get(f"/api/v1/runs/{rid}/samples", params={"candidate": v["model"]}).json()["items"]

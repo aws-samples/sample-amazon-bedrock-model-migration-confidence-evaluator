@@ -86,12 +86,27 @@ def test_parallel_run_is_faster_and_respects_limit(tmp_path, monkeypatch):
     assert run.exec_stats["max_inflight"] == 4
 
 
-def test_replay_passes_are_barriers(tmp_path, monkeypatch):
-    api_mod.configure_transports(candidate_transport=_echo(0.02), judge_transport=None)
+def test_replay_passes_overlap_so_a_slow_call_holds_only_its_own_slot(tmp_path, monkeypatch):
+    seen, lock = {"slow": False}, threading.Lock()
+
+    def transport(payload):
+        text = str(payload.get("input") or "")
+        with lock:   # exactly one slow call: request q0 on the luna candidate, first time only
+            slow = (not seen["slow"]) and "q0" in text and "luna" in payload["model"]
+            if slow:
+                seen["slow"] = True
+        time.sleep(0.6 if slow else 0.01)
+        return {"output_text": "answer", "usage": {"input_tokens": 10, "output_tokens": 3}}
+    api_mod.configure_transports(candidate_transport=transport, judge_transport=None)
     c, rid = _client_n(tmp_path, monkeypatch, n=5)
     run = _launch(c, rid, parallelism=4, replays=2)
-    starts = [e.data["replay"] for e in run.events if e.type == "call_start"]
-    assert starts == sorted(starts)                      # no pass-1 call before every pass-0 call
+    ev = run.events
+    slow_done = next(i for i, e in enumerate(ev) if e.type == "progress" and e.data["replay"] == 0
+                     and e.data["index"] == 0 and e.data["model"].startswith("gpt-5.6-luna"))
+    first_pass2 = next(i for i, e in enumerate(ev) if e.type == "call_start" and e.data["replay"] == 1)
+    assert first_pass2 < slow_done                 # pass 2 started while the slow pass-1 call was still running
+    assert [e.data["replay"] for e in ev if e.type == "pass"] == [0, 1]
+    assert run.status.value == "done" and len(run.results) == 20
 
 
 def test_throttles_are_counted_and_slow_the_run(tmp_path, monkeypatch):

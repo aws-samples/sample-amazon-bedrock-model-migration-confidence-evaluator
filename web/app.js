@@ -498,134 +498,212 @@ function showIngestion(d) {
   pv.append(h("div", { class: "card" }, seg));
 }
 
+// ---- Candidate picker (candidate-picker spec, Option A) ----------------------
+// Left: "Your candidates", each with its own reasoning efforts (each effort = one run).
+// Right: the endpoint's live model list, searchable, suggested first, providers grouped.
+const PICK_ENDPOINT_TEXT = { bedrock_runtime: "Bedrock Runtime", bedrock_mantle: "Bedrock Mantle", litellm: "LiteLLM proxy" };
+const AVAIL = {};   // endpoint -> /models/available response (per page load)
+
+function defaultEffortFor(info) {
+  const ok = (info && info.efforts) || [];
+  if (!info || info.effort_applies === false) return ok[0] || "medium";
+  const def = (MODELS && MODELS.default_reasoning_effort) || "medium";
+  return ok.includes(def) ? def : (ok.includes("medium") ? "medium" : (ok[0] || def));
+}
+
+function candidatePicker(d, legacy, onChange) {
+  const tray = h("div", { class: "pk-tray" });
+  const browse = h("div", { class: "pk-browse" });
+  const status = h("div", { class: "pk-live" });
+  const ui = { query: "", provider: "all", allProviders: false, list: null };
+  const info = (name) => ((ui.list && ui.list.models) || []).find(m => m.name === name);
+  const probing = new Set();
+  const probeErr = {};
+
+  const changed = () => { d.candidates = d.picks.map(p => p.model); drawTray(); drawBrowse(); onChange(); };
+
+  function addPick(name) {
+    if (d.picks.some(p => p.model === name)) return;
+    const m = info(name);
+    d.picks.push({ model: name, efforts: [defaultEffortFor(m)] });
+    if (m && m.effort_applies !== false && !m.efforts_checked) probe(name);
+    changed();
+  }
+  const removePick = (name) => { d.picks = d.picks.filter(p => p.model !== name); changed(); };
+
+  async function probe(name) {
+    probing.add(name); delete probeErr[name]; drawTray();
+    try {
+      const r = await api("/models/probe-efforts", { method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name }) });
+      const m = info(name);
+      if (m) { m.efforts = r.efforts; m.efforts_checked = !!r.efforts; }
+      if (!r.efforts) probeErr[name] = Object.values(r.errors || {})[0] || "no effort was accepted";
+      const p = d.picks.find(x => x.model === name);
+      if (p && r.efforts) {
+        p.efforts = p.efforts.filter(e => r.efforts.includes(e));
+        if (!p.efforts.length) p.efforts = [defaultEffortFor(m)];
+      }
+    } catch (e) { probeErr[name] = e && e.message ? e.message : "check failed"; }
+    probing.delete(name); changed();
+  }
+
+  function tags(m) {
+    if (!m) return [];
+    return [m.suggested ? h("span", { class: "pk-tag sug" }, "suggested") : null,
+      m.like_for_like ? h("span", { class: "pk-tag peer" }, "like-for-like") : null,
+      (m.catalog && m.provider !== "OpenAI") ? h("span", { class: "pk-tag" }, "cross-family") : null,
+      m.price ? null : h("span", { class: "pk-tag warn", title: "No list price configured: cost is left out of ranking" }, "no price")]
+      .filter(Boolean);
+  }
+  const priceText = (m) => m && m.price ? `$${m.price.input_per_1m.toFixed(2)} / $${m.price.output_per_1m.toFixed(2)} per 1M` : "no price";
+
+  function effortChips(p) {
+    const m = info(p.model);
+    if (m && m.effort_applies === false) {
+      return h("div", { class: "pk-eff" }, h("span", { class: "pk-chip on" }, "default"),
+        h("span", { class: "muted", style: "font-size:11px" }, "reasoning effort doesn't apply on this path"));
+    }
+    if (probing.has(p.model)) return h("div", { class: "pk-eff muted", style: "font-size:11px" }, "Checking which efforts this model accepts…");
+    const ok = (m && m.efforts) || null;
+    if (!ok) {
+      return h("div", { class: "pk-eff" },
+        h("span", { class: "pk-chip on" }, p.efforts[0] || "medium"),
+        h("span", { class: "muted", style: "font-size:11px" },
+          probeErr[p.model] ? `Couldn't check efforts (${probeErr[p.model].slice(0, 90)}). ` : "Efforts not checked yet. "),
+        h("button", { class: "linkbtn", onclick: () => probe(p.model) }, "Check efforts"));
+    }
+    return h("div", { class: "pk-eff", role: "group", "aria-label": `Reasoning efforts for ${p.model}` }, ...ok.map(e => {
+      const on = p.efforts.includes(e);
+      return h("button", { class: "pk-chip" + (on ? " on" : ""), "aria-pressed": on ? "true" : "false",
+        title: on ? `Remove ${p.model}@${e}` : `Also run ${p.model}@${e}`,
+        onclick: () => {
+          if (on && p.efforts.length === 1) return;       // keep at least one effort
+          p.efforts = on ? p.efforts.filter(x => x !== e) : ok.filter(x => x === e || p.efforts.includes(x));
+          changed();
+        } }, e);
+    }));
+  }
+
+  function drawTray() {
+    clear(tray);
+    const runs = d.picks.reduce((a, p) => a + p.efforts.length, 0);
+    tray.append(h("div", { class: "row spread", style: "margin-bottom:4px" },
+      h("b", {}, `Your candidates · ${d.picks.length} model${d.picks.length === 1 ? "" : "s"} → ${runs} run${runs === 1 ? "" : "s"}`),
+      h("span", { class: "muted", style: "font-size:11px" }, "click an effort to add or remove it")));
+    if (!d.picks.length) {
+      tray.append(h("div", { class: "muted", style: "padding:18px 6px" }, "No candidates yet. Add models from the list on the right."));
+      return;
+    }
+    d.picks.forEach(p => {
+      const m = info(p.model);
+      tray.append(h("div", { class: "pk-trow" },
+        h("div", {}, h("b", { class: "mono" }, p.model), " ", ...tags(m),
+          h("div", { class: "pk-meta" }, `${(m && m.provider) || "—"} · ${priceText(m)}`)),
+        h("button", { class: "pk-x", title: `Remove ${p.model}`, "aria-label": `Remove ${p.model}`, onclick: () => removePick(p.model) }, "×"),
+        h("div", { style: "grid-column:1/3" }, effortChips(p))));
+    });
+    tray.append(h("div", { class: "pk-runs mono" }, d.picks.flatMap(p => p.efforts.map(e =>
+      (info(p.model) || {}).effort_applies === false ? p.model : `${p.model}@${e}`)).join(" · ")));
+  }
+
+  function drawBrowse() {
+    clear(browse);
+    const list = (ui.list && ui.list.models) || [];
+    const q = ui.query.trim().toLowerCase();
+    const match = (m) => !q || [m.name, m.display, m.provider, m.model_id].some(x => (x || "").toLowerCase().includes(q));
+    const counts = {};
+    list.forEach(m => { counts[m.provider] = (counts[m.provider] || 0) + 1; });
+    const provs = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+    const shown = ui.allProviders ? provs : provs.slice(0, 4);
+    const search = h("input", { type: "search", class: "pk-search", placeholder: `Search ${list.length} models…`,
+      value: ui.query, "aria-label": "Search models",
+      oninput: (e) => { ui.query = e.target.value; const pos = e.target.selectionStart; drawBrowse();
+        const s = browse.querySelector(".pk-search"); s.focus(); s.setSelectionRange(pos, pos); } });
+    const chip = (key, label, n) => h("button", { class: "pk-chip" + (ui.provider === key ? " on" : ""),
+      onclick: () => { ui.provider = key; drawBrowse(); } }, label, h("span", { class: "n" }, ` ${n}`));
+    browse.append(search, h("div", { class: "pk-provs" }, chip("all", "All", list.length),
+      ...shown.map(([p, n]) => chip(p, p, n)),
+      provs.length > 4 ? h("button", { class: "pk-chip", onclick: () => { ui.allProviders = !ui.allProviders; drawBrowse(); } },
+        ui.allProviders ? "fewer" : `+${provs.length - 4} more`) : null));
+
+    const visible = list.filter(m => match(m) && (ui.provider === "all" || m.provider === ui.provider));
+    const row = (m) => {
+      const on = d.picks.some(p => p.model === m.name);
+      const r = h("div", { class: "pk-lrow", role: "button", tabindex: "0", "aria-pressed": on ? "true" : "false",
+        title: on ? "Remove from candidates" : "Add to candidates" },
+        h("span", { class: "pk-plus" + (on ? " done" : "") }, on ? "✓" : "+"),
+        h("div", { class: "grow" }, h("b", { class: "mono" }, m.name), " ", ...tags(m).filter(t => !t.classList.contains("sug")),
+          h("div", { class: "pk-meta" }, (m.catalog ? "built-in" : m.model_id)
+            + " · " + (m.price ? "priced" : "no price")
+            + (m.effort_applies === false ? " · effort n/a" : (m.efforts_checked ? " · efforts known" : " · efforts checked on add")))));
+      const toggle = () => (on ? removePick(m.name) : addPick(m.name));
+      r.addEventListener("click", toggle);
+      r.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggle(); } });
+      return r;
+    };
+    const body = h("div", { class: "pk-list" });
+    const sug = visible.filter(m => m.suggested);
+    if (sug.length) body.append(h("div", { class: "pk-group" }, h("span", {}, `Suggested for ${legacy || "your model"}`), h("span", {}, String(sug.length))), ...sug.map(row));
+    const rest = visible.filter(m => !m.suggested);
+    const groups = {};
+    rest.forEach(m => { (groups[m.provider] = groups[m.provider] || []).push(m); });
+    const order = Object.keys(groups).sort((a, b) => (groups[b].some(m => m.catalog) - groups[a].some(m => m.catalog)) || groups[b].length - groups[a].length);
+    order.forEach((p, i) => {
+      // Expanded: while searching, when filtered to one provider, or the first (built-in) group.
+      const open = !!q || ui.provider !== "all" || i === 0;
+      const det = h("details", { class: "pk-det" },
+        h("summary", { class: "pk-group" }, h("span", {}, p), h("span", {}, String(groups[p].length))), ...groups[p].map(row));
+      if (open) det.open = true;
+      body.append(det);
+    });
+    if (!visible.length) body.append(h("div", { class: "muted", style: "padding:12px 4px" },
+      list.length ? "No model matches your search." : "No models to show."));
+    browse.append(body);
+  }
+
+  async function load(refresh = false) {
+    const ep = d.endpoint || "bedrock_runtime";
+    clear(status); status.append(h("span", { class: "muted" }, `Listing models from ${PICK_ENDPOINT_TEXT[ep]}…`));
+    let res = (!refresh && AVAIL[ep]) || null;
+    if (!res) {
+      try { res = await api(`/models/available?endpoint=${encodeURIComponent(ep)}&legacy=${encodeURIComponent(legacy || "")}${refresh ? "&refresh=true" : ""}`); }
+      catch (e) { res = { models: [], reason: e && e.message ? e.message : "request failed", count: 0 }; }
+      if (!res.reason) AVAIL[ep] = res;
+    }
+    ui.list = res;
+    // Keep only picks this endpoint can run (e.g. switching to LiteLLM drops unserved models).
+    const names = new Set((res.models || []).map(m => m.name));
+    d.picks = d.picks.filter(p => names.has(p.model));
+    if (!d.picks.length && !d.pickedOnce) {
+      d.picks = (res.models || []).filter(m => m.suggested).map(m => ({ model: m.name, efforts: [defaultEffortFor(m)] }));
+    }
+    d.pickedOnce = true;
+    clear(status);
+    status.append(h("i", { class: res.reason ? "bad" : "" }),
+      res.reason ? `${PICK_ENDPOINT_TEXT[ep]}: ${res.reason}. Showing built-in models only. `
+        : `Listed live from ${PICK_ENDPOINT_TEXT[ep]}${res.region && ep !== "litellm" ? " · " + res.region : ""} · ${res.listed_count} models · `,
+      h("button", { class: "linkbtn", onclick: () => load(true) }, "refresh"));
+    changed();
+  }
+
+  return { tray, browse, status, load };
+}
+
 function newRunConfig(main, d) {
   const legacy = d.ingestion?.detected_models?.[0]?.model;
   const entry = (MODELS?.matrix || []).find(e => normModel(e.legacy_model) === normModel(legacy));
-  const allModels = Object.keys(MODELS?.models || {});
-  // Matrix candidates first (pre-selected), then every other catalog model
-  // (incl. Claude) as available extras for a cross-family comparison.
-  const primary = entry ? entry.candidates.slice() : allModels;
-  const extras = allModels.filter(m => !primary.includes(m));
-  const cands = [...primary, ...extras];
   const mapped = !!entry;
-  if (!d.candidates.length) {
-    d.candidates = entry ? entry.candidates.slice() : (allModels.length ? [allModels[0]] : []);
+  // Candidates + per-model efforts. Migrates state from the older global-effort form.
+  if (!Array.isArray(d.picks)) {
+    const effs = (Array.isArray(d.efforts) && d.efforts.length) ? d.efforts : [d.effort || "medium"];
+    d.picks = (d.candidates || []).map(m => ({ model: m, efforts: candidateEfforts(m, effs).length ? candidateEfforts(m, effs) : [effortsFor(m)[0]] }));
+    if (d.picks.length) d.pickedOnce = true;
   }
-  const cardsWrap = h("div", { class: "grid cols-3" });
-  cands.forEach(m => {
-    const fam = MODELS?.models?.[m]?.family;
-    const card = h("div", { class: "candcard" + (d.candidates.includes(m) ? " sel" : "") },
-      h("div", { class: "row spread" }, h("strong", {}, m),
-        h("span", {}, MODELS?.models?.[m]?.like_for_like ? h("span", { class: "badge" }, "peer") : null,
-          (fam && fam !== "openai") ? h("span", { class: "badge", style: "margin-left:4px" }, fam) : null)),
-      h("div", { class: "muted", style: "font-size:12px;margin-top:4px" },
-        m === entry?.default_start ? "recommended start"
-          : (fam && fam !== "openai" ? "cross-family baseline" : "candidate")));
-    card.addEventListener("click", () => {
-      const i = d.candidates.indexOf(m);
-      if (i >= 0) d.candidates.splice(i, 1); else d.candidates.push(m);
-      card.classList.toggle("sel");
-      updatePlan(d);
-    });
-    cardsWrap.append(card);
-  });
-
-  // --- Dynamic LiteLLM discovery: aliases the configured proxy actually serves.
-  // Shown only when the endpoint is LiteLLM. Discovered aliases NOT in the catalog
-  // are added to d.candidates as raw names (run through the proxy as-is; scored
-  // normally, cost skipped when un-priced). Catalog aliases are skipped (already above).
-  const discoveredWrap = h("div", { style: "margin-top:14px" });
-  async function loadDiscovered() {
-    clear(discoveredWrap);
-    const litellm = d.endpoint === "litellm";
-    // On the LiteLLM path the catalog (Bedrock) cards don't apply — hide them and
-    // let the proxy's discovered models BE the candidate list. Restore otherwise.
-    cardsWrap.style.display = litellm ? "none" : "";
-    const catHead = document.getElementById("catalogCandHeading");
-    if (catHead) catHead.style.display = litellm ? "none" : "";
-    if (!litellm) return;
-    const head = h("div", { class: "row spread", style: "margin-bottom:6px" },
-      h("div", { style: "font-weight:600" }, "Candidate models (from your LiteLLM proxy)"),
-      h("button", { class: "btn ghost", onclick: () => loadDiscovered() }, "↻ Refresh"));
-    const status = h("div", { class: "muted", style: "font-size:12px;margin-bottom:8px" }, "Querying proxy…");
-    discoveredWrap.append(head, status);
-    let res;
-    try { res = await api("/litellm/models"); }
-    catch (e) { status.textContent = "Could not query the proxy: " + (e && e.message ? e.message : "error"); return; }
-    const models = res.models || [];
-    if (!models.length) {
-      status.textContent = res.reason
-        ? `No models from ${res.base || "the proxy"} — ${res.reason}`
-        : `No models registered on ${res.base || "the proxy"}.`;
-      return;
-    }
-    // Drop any lingering catalog (Bedrock) selections that aren't served by the proxy,
-    // so the plan reflects only what's actually selectable on this path.
-    const served = new Set(models);
-    d.candidates = d.candidates.filter(m => served.has(m));
-    // Split: registered model-group aliases (what an admin configured) vs LiteLLM's
-    // automatic bedrock/* passthrough (often 100s) — show aliases as the primary
-    // picker, tuck the passthrough behind a toggle so it doesn't flood the screen.
-    const primary = models.filter(m => !m.startsWith("bedrock/"));
-    const passthrough = models.filter(m => m.startsWith("bedrock/"));
-    const primaryList = primary.length ? primary : models;  // if all are bedrock/, show them
-    status.textContent = `${primary.length} model group(s) from ${res.base}`
-      + (passthrough.length ? ` (+${passthrough.length} bedrock/* passthrough)` : "")
-      + ". Pick any to evaluate through the proxy (cost shown only if priced).";
-
-    function makeCard(alias) {
-      const card = h("div", { class: "candcard" + (d.candidates.includes(alias) ? " sel" : "") },
-        h("div", { class: "row spread" }, h("strong", {}, alias),
-          h("span", { class: "badge" }, "proxy")),
-        h("div", { class: "muted", style: "font-size:12px;margin-top:4px" }, "LiteLLM-discovered candidate"));
-      card.addEventListener("click", () => {
-        const i = d.candidates.indexOf(alias);
-        if (i >= 0) d.candidates.splice(i, 1); else d.candidates.push(alias);
-        card.classList.toggle("sel");
-        updatePlan(d);
-      });
-      return card;
-    }
-
-    const grid = h("div", { class: "grid cols-3" });
-    primaryList.forEach(a => grid.append(makeCard(a)));
-    discoveredWrap.append(grid);
-
-    // Collapsible bedrock/* passthrough (only when there ARE registered aliases,
-    // otherwise they're already shown above).
-    if (primary.length && passthrough.length) {
-      const moreGrid = h("div", { class: "grid cols-3", style: "margin-top:10px" });
-      passthrough.forEach(a => moreGrid.append(makeCard(a)));
-      discoveredWrap.append(h("details", { style: "margin-top:10px" },
-        h("summary", { style: "cursor:pointer;font-size:12px;color:var(--muted)" },
-          `Show all ${passthrough.length} bedrock/* passthrough models`),
-        moreGrid));
-    }
-  }
-
-  // Multi-select: every chosen effort runs as its own candidate (model@effort), so the same
-  // model at two efforts is compared side by side. At least one effort stays selected.
-  if (!Array.isArray(d.efforts) || !d.efforts.length) d.efforts = [d.effort || "medium"];
-  const effortHint = h("div", { id: "effortHint", class: "muted", style: "font-size:11px;margin-top:6px" });
-  const effortSeg = h("div", { class: "seg" }, ...EFFORTS.map(x =>
-    h("button", { class: d.efforts.includes(x) ? "active" : "", "aria-pressed": d.efforts.includes(x) ? "true" : "false",
-      onclick: e => {
-        const on = d.efforts.includes(x);
-        if (on && d.efforts.length === 1) return;  // keep at least one
-        d.efforts = on ? d.efforts.filter(v => v !== x) : [...d.efforts, x];
-        d.effort = d.efforts[0];
-        effortSeg.querySelectorAll("button").forEach(b => {
-          const sel = d.efforts.includes(b.textContent);
-          b.classList.toggle("active", sel);
-          b.setAttribute("aria-pressed", sel ? "true" : "false");
-        });
-        updatePlan(d);  // also refreshes the skip hint
-      } }, x)));
-  effortHint.textContent = effortSkipNote(d.candidates, d.efforts);
-  const effortField = h("div", {}, effortSeg, effortHint);
+  const picker = candidatePicker(d, legacy, () => updatePlan(d));
   const ENDPOINTS = [
     ["bedrock_runtime", "Bedrock Runtime", "us.openai.* · /openai/v1 · Luna/Terra/Sol/GPT-5.4"],
-    ["bedrock_mantle", "Bedrock Mantle", "openai.* · /openai/v1 · needs a Bedrock API key"],
+    ["bedrock_mantle", "Bedrock Mantle", "openai.* and other providers · /openai/v1 and /v1 · signed with your AWS credentials"],
     ["litellm", "LiteLLM proxy", "your proxy · /v1/chat/completions"],
   ];
   // If a mantle-only model is selected, force Mantle and lock the others.
@@ -636,7 +714,7 @@ function newRunConfig(main, d) {
       class: v === d.endpoint ? "active" : "",
       title: hasMantleOnly && v !== "bedrock_mantle" ? "Disabled — a mantle-only model is selected" : hint,
       disabled: hasMantleOnly && v !== "bedrock_mantle",
-      onclick: () => { d.endpoint = v; pathSeg.querySelectorAll("button").forEach((b) => b.classList.toggle("active", b.textContent === t)); loadDiscovered(); updatePlan(d); },
+      onclick: () => { d.endpoint = v; pathSeg.querySelectorAll("button").forEach((b) => b.classList.toggle("active", b.textContent === t)); picker.load(); updatePlan(d); },
     }, t)));
   const mantleModels = d.candidates.filter(m => MODELS?.models?.[m] && MODELS.models[m].runtime_supported === false);
   const endpointHint = h("div", { class: "muted", style: "font-size:11px;margin-top:4px" },
@@ -729,16 +807,14 @@ function newRunConfig(main, d) {
 
   main.append(h("div", { class: "card" },
     h("h3", {}, "2 · Configuration"),
-    h("div", { id: "catalogCandHeading", class: "muted", style: "margin-bottom:8px" }, "Candidate models" + (
-      mapped ? ` (pre-filled from matrix for ${legacy})`
-             : ` — “${legacy || "unknown"}” isn’t in the migration matrix; pick any candidate to evaluate against`)),
-    cardsWrap,
-    discoveredWrap,
-    h("div", { class: "grid cols-2", style: "margin-top:18px" },
-      h("label", { class: "field" }, h("span", {}, "Reasoning effort (start at medium to baseline; pick several to compare — each model × effort runs as its own candidate)"), effortField),
-      h("label", { class: "field" }, h("span", {}, "Endpoint"), pathSeg, endpointHint)),
+    h("div", { class: "row spread", style: "align-items:flex-end;gap:14px;flex-wrap:wrap" },
+      h("label", { class: "field", style: "margin:0" }, h("span", {}, "Call models through"), pathSeg, endpointHint),
+      picker.status),
+    h("div", { class: "muted", style: "margin:12px 0 8px" }, "Candidate models" + (
+      mapped ? ` (suggested for ${legacy} are pre-selected)`
+             : ` — “${legacy || "unknown"}” isn’t in the migration matrix; add any models to compare`)),
+    h("div", { class: "pk-grid" }, picker.tray, picker.browse),
     replayField(d),
-    recommendField(d),
     targetingField,
     limitField,
     steeringField,
@@ -749,40 +825,7 @@ function newRunConfig(main, d) {
         h("button", { class: "btn secondary", onclick: () => launch(d, true) }, "Dry run (no spend)"),
         h("button", { class: "btn", onclick: () => launch(d, false) }, "Review & launch")))));
   updatePlan(d);
-  loadDiscovered();
-}
-
-// Configuration step: how to rank candidates (changeable after the run) + optional volume.
-function recommendField(d) {
-  d.weightsPreset = d.weightsPreset || "balanced";
-  d.customWeights = d.customWeights || { quality: 50, cost: 30, latency: 20 };
-  const custom = h("div", { class: "custom-weights", style: d.weightsPreset === "custom" ? "" : "display:none" },
-    ...[["quality", "Quality", 20], ["cost", "Cost", 0], ["latency", "Latency", 0]].flatMap(([k, label, min]) => {
-      const out = h("span", { class: "tnum" }, String(d.customWeights[k]));
-      return [h("span", { class: "muted" }, label),
-        h("input", { type: "range", min: String(min), max: "100", value: String(d.customWeights[k]), "aria-label": `${label} weight`,
-          oninput: e => { d.customWeights[k] = parseInt(e.target.value, 10); out.textContent = String(d.customWeights[k]); } }),
-        out];
-    }));
-  const seg = h("div", { class: "seg" }, ...PRESETS.map(([k, t]) =>
-    h("button", { class: k === d.weightsPreset ? "active" : "", "aria-pressed": k === d.weightsPreset ? "true" : "false",
-      onclick: () => {
-        d.weightsPreset = k;
-        seg.querySelectorAll("button").forEach((b, i) => {
-          const on = PRESETS[i][0] === k;
-          b.classList.toggle("active", on); b.setAttribute("aria-pressed", on ? "true" : "false");
-        });
-        custom.style.display = k === "custom" ? "" : "none";
-      } }, t)));
-  const vol = h("input", { type: "number", min: "0", step: "1000", placeholder: "e.g. 250000",
-    value: d.monthlyVolume ? String(d.monthlyVolume) : "", style: "width:180px",
-    oninput: e => { const n = parseInt(e.target.value, 10); d.monthlyVolume = Number.isFinite(n) && n > 0 ? n : null; } });
-  return h("div", { class: "grid cols-2", style: "margin-top:12px" },
-    h("label", { class: "field" },
-      h("span", {}, "Optimise for (how the final recommendation weighs quality, cost and latency — you can change it after the run)"),
-      seg, custom),
-    h("label", { class: "field" },
-      h("span", {}, "Expected requests / month (optional — adds a projected monthly cost per candidate)"), vol));
+  picker.load();
 }
 
 // Which of the selected efforts each model actually runs. Unsupported ones are skipped (Bedrock
@@ -810,10 +853,8 @@ function effortSkipNote(models, selected) {
 }
 
 async function updatePlan(d) {
-  const hint = document.getElementById("effortHint");
-  if (hint) hint.textContent = effortSkipNote(d.candidates, (d.efforts && d.efforts.length) ? d.efforts : [d.effort || "medium"]);
   const box = $("#planBox"); if (!box) return;
-  if (!d.candidates.length) { box.textContent = "select a candidate"; return; }
+  if (!(d.picks || []).length) { box.textContent = "add a candidate"; return; }
   try {
     const plan = await api(`/runs/${d.runId}/plan`, { method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify(cfgBody(d)) });
@@ -871,8 +912,7 @@ function replayField(d) {
 function cfgBody(d) {
   const callPath = d.endpoint === "litellm" ? "litellm" : "bedrock";
   const bedrockEndpoint = d.endpoint === "bedrock_mantle" ? "mantle" : "runtime";
-  const efforts = (Array.isArray(d.efforts) && d.efforts.length) ? d.efforts : [d.effort || "medium"];
-  return { candidates: d.candidates.flatMap(m => candidateEfforts(m, efforts).map(e => ({ model: m, reasoning_effort: e }))),
+  return { candidates: (d.picks || []).flatMap(p => p.efforts.map(e => ({ model: p.model, reasoning_effort: e }))),
            name: d.name || null,
            call_path: callPath, bedrock_endpoint: bedrockEndpoint,
            sampling_mode: d.samplingMode || "all",
@@ -880,10 +920,6 @@ function cfgBody(d) {
            judge_steering: d.judgeSteering || null,
            filter_teams: (d.filterTeams && d.filterTeams.length) ? d.filterTeams : null,
            filter_users: (d.filterUsers && d.filterUsers.length) ? d.filterUsers : null,
-           weights: d.weightsPreset === "custom"
-             ? { preset: "custom", ...(d.customWeights || { quality: 50, cost: 30, latency: 20 }) }
-             : { preset: d.weightsPreset || "balanced" },
-           monthly_volume: d.monthlyVolume > 0 ? d.monthlyVolume : null,
            replays: d.replaysOn ? (d.replayN || 3) : 1 };
 }
 
@@ -973,7 +1009,7 @@ const CELL = {
 };
 const cellKind = (cell) => !cell ? "pend" : cell.status === "error" ? "er"
   : cell.from_cache ? "ca" : (cell.attempts || 1) > 1 ? "rt" : "ok";
-const retryWhy = (r) => (r === "throttled" ? "a throttle" : r === "error" ? "an error" : r || "an error");
+const retryWhy = (r) => (r === "throttled" ? "a throttle" : r === "timeout" ? "a timeout" : r === "error" ? "an error" : r || "an error");
 
 function renderProgress(el, runId) {
   clear(el);
@@ -1089,8 +1125,11 @@ function renderProgress(el, runId) {
     const kpi = (l, v, s, amber) => h("div", { class: "rp-kpi" + (amber ? " amber" : "") }, h("div", { class: "l" }, l),
       h("div", { class: "v" }, ...v), h("div", { class: "s" }, s));
     const live = S.stage === "replay";
-    const parSub = !live ? `limit ${S.par}` : S.waiting && !S.inflight.size ? "waiting for capacity"
-      : slowed() ? "slowed by throttling" : S.par === 1 ? "one call at a time" : "at the configured limit";
+    const nIn = S.inflight.size, remaining = S.total ? S.total - S.done : null;
+    const parSub = !live ? `limit ${S.par}` : S.waiting && !nIn ? "waiting for capacity"
+      : slowed() ? "slowed by throttling" : S.par === 1 ? "one call at a time"
+      : (remaining != null && nIn >= remaining) ? "last calls finishing"
+      : nIn >= effMin() ? "at the configured limit" : "below the limit";
     kpiEl.replaceChildren(
       kpi("Calls", [String(S.done), h("small", {}, ` / ${S.total || "?"}`)], `${S.done - S.errors} ok · ${S.errors} failed`),
       kpi("Parallel calls", [String(live ? S.inflight.size : 0), h("small", {}, ` of ${live ? effMin() : S.par}`)],
@@ -1655,7 +1694,8 @@ function recommendationPanel(res, runId, onChanged) {
   const hero = h("div", { class: "pcard hero" },
     h("div", { class: "lbl" }, "Best overall"),
     h("div", { class: "hero-top" },
-      confRing(v.migration_confidence, BAND_COLOR[v.verdict_band] || "var(--ok)", 112),
+      h("div", { class: "ringwrap" }, confRing(v.migration_confidence, BAND_COLOR[v.verdict_band] || "var(--ok)", 112),
+        ciText(v) ? h("div", { class: "ci-line", title: CI_TITLE }, ciText(v)) : null),
       h("div", { style: "flex:1;min-width:0" },
         h("div", { class: "pick" }, bo.model || "—"),
         h("div", { class: "row", style: "gap:6px;flex-wrap:wrap;margin:6px 0 12px" },
@@ -1723,6 +1763,14 @@ const sv = (tag, attrs = {}, text) => {
 };
 
 // Confidence (0-100) as a ring, coloured by verdict band.
+// 95% bootstrap interval of a candidate's Migration Confidence, e.g. "95% CI 79–97" (null if not computed).
+function ciText(v, prefix = "95% CI ") {
+  return v && v.confidence_ci_low != null && v.confidence_ci_high != null
+    ? `${prefix}${Math.round(v.confidence_ci_low)}–${Math.round(v.confidence_ci_high)}` : null;
+}
+const CI_TITLE = "95% confidence interval from a bootstrap over the requests: the range the score would likely "
+  + "land in with a different sample of requests like these. Fewer requests = a wider range.";
+
 function confRing(conf, color, size) {
   const r = size / 2 - 8, c = 2 * Math.PI * r, mid = size / 2, val = Math.max(0, Math.min(100, conf || 0));
   const s = sv("svg", { width: size, height: size, viewBox: `0 0 ${size} ${size}`, role: "img",
@@ -1753,10 +1801,14 @@ function latencyRange(v, maxMs) {
   return s;
 }
 
-// A number with a small comparison bar; best value in the column marked ▲.
+// Marks the best value in a column/row. A trophy, not an arrow: an arrow reads as
+// "this metric went up", which is not what it means.
+const BEST_ICON = "🏆";
+
+// A number with a small comparison bar; best value in the column marked with BEST_ICON.
 function barCell(text, frac, color, best) {
   return h("td", { class: "tnum barcell" }, h("div", { class: "bc" },
-    h("span", {}, text, best ? h("span", { class: "bestmark", title: "Best in this column" }, "▲") : null),
+    h("span", {}, text, best ? h("span", { class: "bestmark", title: "Best in this column" }, BEST_ICON) : null),
     frac == null ? null : h("div", { class: "axbar" },
       h("span", { style: `width:${Math.max(3, Math.min(100, 100 * frac))}%;background:${color}` }))));
 }
@@ -1832,7 +1884,8 @@ async function renderResults(el, runId) {
       picks.length ? h("div", { class: "row", style: "gap:6px;margin-top:6px;flex-wrap:wrap" },
         ...picks.map(k => h("span", { class: "chip pick" }, PROFILE_CHIP[k]))) : null,
       elig,
-      h("div", { class: "metric", style: "margin-top:10px" }, h("div", { class: "value tnum" }, fmtPct(v.migration_confidence)), h("div", { class: "label" }, "Migration Confidence")),
+      h("div", { class: "metric", style: "margin-top:10px" }, h("div", { class: "value tnum" }, fmtPct(v.migration_confidence)), h("div", { class: "label" }, "Migration Confidence"),
+        ciText(v) ? h("div", { class: "ci-line", title: CI_TITLE }, ciText(v)) : null),
       bar,
       h("div", { class: "muted mono", style: "font-size:12px" }, LABELS.map(l => `${(dist[l] || 0)} ${LABEL_TEXT[l]}`).join(" · ")),
       (v.replays || 1) > 1 ? h("div", { class: "muted", style: "font-size:11px;margin-top:2px" },
@@ -1882,7 +1935,14 @@ async function renderResults(el, runId) {
           h("td", {}, h("span", { class: "band " + v.verdict_band }, BAND_TEXT[v.verdict_band]),
             v.unstable ? h("span", { class: "band unstable", style: "margin-left:4px",
               title: "Average consistency (D7) is below the instability threshold: answers to the same request vary a lot." }, "Unstable") : null),
-          barCell(fmtPct(v.migration_confidence), fc, "var(--ok)", bc),
+          (() => {
+            const td = barCell(fmtPct(v.migration_confidence), fc, "var(--ok)", bc);
+            const ci = ciText(v, "");
+            const tied = (rec && rec.quality_ties || []).includes(v.model);
+            if (ci) td.append(h("div", { class: "ci-line", style: "text-align:right", title: CI_TITLE },
+              ci, tied ? h("span", { class: "tiechip", title: "Statistically tied with the best-quality candidate: the data can't separate them on quality" }, "≈ tied") : null));
+            return td;
+          })(),
           barCell(fmtPct(v.hard_break_rate * 100), fh, "var(--bad)", bh),
           ...(hasD7 ? [(() => {
             const [fd, bd] = cD7(v);
@@ -1911,16 +1971,18 @@ async function renderResults(el, runId) {
       h("span", {}, h("i", { class: "tick" }), "average"),
       h("span", {}, h("i", { style: "background:rgba(34,211,238,.45);width:18px" }), "out to p95 (slowest 5%)")),
     h("div", { class: "muted", style: "font-size:11px;margin-top:6px" },
-      "Bars compare candidates within each column; ▲ marks the best. Dimmed rows didn't pass the quality gate. "
+      "Bars compare candidates within each column; 🏆 marks the best. The range under Confidence is its 95% interval; "
+      + "≈ tied means it can't be separated from the best on quality. Dimmed rows didn't pass the quality gate. "
       + "Cost is list price at current public Bedrock rates, assuming no prompt caching; vs current compares the same requests against today's model, when its price is known. "
       + "† Latency is indicative only (see the note above). Overall score is the weighted recommendation score; only models that passed the gate get one."));
 
   // D1–D6 × candidate breakdown: why one model beats another, without drilling in.
-  const breakdown = dimBreakdown(res.candidates);
+  const breakdown = dimBreakdown(res.candidates, rec);
   if (breakdown) {
     el.append(h("div", { class: "row spread", style: "margin-top:20px" },
       h("h3", { style: "margin:0" }, "Dimension breakdown"),
-      h("span", { class: "muted", style: "font-size:11px" }, "average score per dimension · 0.00–1.00 · green ≥ 0.85 · amber 0.60–0.85 · red < 0.60 · best per row ▲")),
+      h("span", { class: "muted", style: "font-size:11px" }, "average score per dimension · 0.00–1.00 · green ≥ 0.85 · amber 0.60–0.85 · red < 0.60 · best per row 🏆"
+        + (rec && !rec.none_eligible ? " · tinted columns are the recommended picks (outlined = Best overall)" : ""))),
       breakdown);
   }
   if (res.candidates.some(v => v.consistency != null)) el.append(leastConsistentCard(el, runId, res.candidates));
@@ -2264,25 +2326,33 @@ function dimBars(avgs) {
   return h("div", { class: "dimbars" }, ...rows);
 }
 
-// D1–D6 × candidate table; highlights the best candidate per dimension.
-function dimBreakdown(cands) {
+// D1–D6 × candidate table; highlights the best candidate per dimension, and labels the
+// columns of the models the recommendation picked (Best overall / quality / economical / latency).
+function dimBreakdown(cands, rec) {
   const dims = DIMENSIONS.filter(d => cands.some(v => typeof (v.dimension_averages || {})[d.key] === "number"));
   if (!dims.length || !cands.length) return null;
-  const head = h("tr", {}, h("th", {}, "Dimension"), ...cands.map(v => h("th", { class: "mono" }, v.model)));
-  const body = dims.map(d => {
+  const order = ["best_overall", "best_quality", "most_economical", "lowest_latency"];
+  const picks = cands.map(v => picksFor(rec, v.model).sort((a, b) => order.indexOf(a) - order.indexOf(b)));
+  const colCls = (i) => !picks[i].length ? "" : (picks[i].includes("best_overall") ? "pickcol bo" : "pickcol");
+  const head = h("tr", {}, h("th", {}, "Dimension"), ...cands.map((v, i) => h("th", { class: ("mono " + colCls(i)).trim() },
+    v.model,
+    picks[i].length ? h("div", { class: "colpicks" },
+      ...picks[i].map(k => h("span", { class: "chip" + (k === "best_overall" ? " pick" : ""), title: PROFILE_TEXT[k] }, PROFILE_CHIP[k]))) : null)));
+  const body = dims.map((d, ri) => {
     const vals = cands.map(v => (v.dimension_averages || {})[d.key]);
     const nums = vals.filter(x => typeof x === "number");
     const best = nums.length > 1 ? Math.max(...nums) : null;
     const spread = nums.length > 1 && Math.max(...nums) - Math.min(...nums) > 0.001;
+    const last = ri === dims.length - 1 ? " last" : "";
     return h("tr", { class: "static" },
       h("td", { title: d.desc },
         h("b", {}, d.code), " " + d.name,
         d.hard ? h("span", { class: "hardtag", title: "A failure here caps the verdict at Incompatible" }, "hard-break") : null),
-      ...vals.map(x => typeof x !== "number"
-        ? h("td", { class: "muted heat" }, "—")
-        : h("td", { class: "heat" }, h("div", { class: "heatcell tnum", style: `background:${heatBg(x)}`,
+      ...vals.map((x, i) => typeof x !== "number"
+        ? h("td", { class: ("muted heat " + colCls(i) + (colCls(i) ? last : "")).trim() }, "—")
+        : h("td", { class: ("heat " + colCls(i) + (colCls(i) ? last : "")).trim() }, h("div", { class: "heatcell tnum", style: `background:${heatBg(x)}`,
             title: `${d.name}: ${x.toFixed(2)}` + ((spread && x === best) ? " (best)" : "") },
-            x.toFixed(2), (spread && x === best) ? h("span", { class: "bestmark", title: "Best on this dimension" }, "▲") : null))));
+            x.toFixed(2), (spread && x === best) ? h("span", { class: "bestmark", title: "Best on this dimension" }, BEST_ICON) : null))));
   });
   return h("table", { class: "breakdown heatmap" }, h("thead", {}, head), h("tbody", {}, ...body));
 }
@@ -2832,6 +2902,8 @@ async function renderSettings(main) {
   const latSeg = h("div", { class: "seg" }, ...[["per_token", "ms per output token"], ["p50", "median end-to-end"]].map(([k, t]) =>
     h("button", { class: (rs.latency_metric || "per_token") === k ? "active" : "",
       onclick: () => { recDraft.latency_metric = k; latSeg.querySelectorAll("button").forEach((b, i) => b.classList.toggle("active", i === (k === "p50" ? 1 : 0))); } }, t)));
+  const tieBox = h("input", { type: "checkbox", id: "statTies", checked: rs.statistical_ties !== false,
+    onchange: e => { recDraft.statistical_ties = e.target.checked; } });
   const presetRows = Object.entries(rs.weight_presets || {}).map(([name, w]) => {
     const cell = (axis) => h("input", { type: "number", step: "0.05", min: "0", value: String(w[axis]), style: "width:80px",
       oninput: e => {
@@ -2897,6 +2969,11 @@ async function renderSettings(main) {
       h("div", { class: "grid cols-2" },
         h("label", { class: "field" }, h("span", {}, "Minimum timed calls before latency counts"), numIn("min_latency_samples", 1)),
         h("label", { class: "field" }, h("span", {}, "Latency measure used for ranking"), latSeg)),
+      h("label", { class: "row", style: "gap:8px;align-items:flex-start;margin:6px 0 4px", for: "statTies" }, tieBox,
+        h("span", {}, "Treat statistically tied quality as equal",
+          h("div", { class: "muted", style: "font-size:12px" },
+            "When a candidate's confidence can't be separated from the best (95% bootstrap interval of the difference "
+            + "includes 0), it gets the full quality score, so cost and latency decide between them. Applies inside the quality window only."))),
       h("div", { class: "muted", style: "margin:10px 0 6px;font-weight:600" }, "Replays and consistency (D7)"),
       h("div", { class: "grid cols-2" },
         h("label", { class: "field" }, h("span", {}, "Default times to send each request when replays are on (2–5)"), numIn("default_replays", 1)),

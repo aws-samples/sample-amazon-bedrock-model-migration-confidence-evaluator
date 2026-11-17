@@ -209,6 +209,8 @@ def build_run_report(run) -> Dict[str, Any]:
             "model": v.model,
             "endpoint": v.endpoint,
             "migration_confidence": v.migration_confidence,
+            "confidence_ci_low": v.confidence_ci_low,       # 95% bootstrap interval
+            "confidence_ci_high": v.confidence_ci_high,
             "verdict_band": v.verdict_band.value,
             "distribution": {k.value: n for k, n in (v.distribution or {}).items()},
             "dimension_averages": v.dimension_averages,

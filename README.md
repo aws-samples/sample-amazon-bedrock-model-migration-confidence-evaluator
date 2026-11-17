@@ -97,6 +97,9 @@ web/ (SPA)  ──REST/SSE──▶  FastAPI (modelshift/api.py)
 | `modelshift/explain.py` | Short data-driven "why this pick" text for each recommendation |
 | `modelshift/consistency.py` | D7 Consistency across replayed answers (agreement, unstable requests, flip rate) |
 | `modelshift/concurrency.py` | Parallel call pool, per-endpoint adaptive throttling, server-wide cap, fail-fast, execution stats |
+| `modelshift/resilience.py` | Per-call timeouts, one retry owner, error classification, capped jittered backoff and a per-call deadline |
+| `modelshift/discovery.py` | Live model lists for Bedrock Runtime, Bedrock Mantle and the LiteLLM proxy, with per-model reasoning-effort probing |
+| `modelshift/stats.py` | Bootstrap confidence intervals and statistical ties for quality, so near-equal models aren't ranked on noise |
 | `modelshift/orchestrator.py` | Run lifecycle state machine + pipeline wiring + dry-run cost preview |
 | `modelshift/api.py` | FastAPI `/api/v1` + SSE + static SPA mount |
 | `modelshift/server.py` | Dev entrypoint (`--demo` / `--live`) |
@@ -130,7 +133,7 @@ Configure AWS creds in your terminal first (`aws configure` / `aws sso login`), 
 ## Test
 
 ```bash
-python -m pytest tests/ -q      # 332 tests
+python -m pytest tests/ -q      # 380 tests
 python -m flake8 modelshift tests
 ```
 

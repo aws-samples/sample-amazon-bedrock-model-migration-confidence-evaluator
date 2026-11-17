@@ -180,6 +180,30 @@ def _pick_best_quality(e: List[CandidateVerdict]) -> CandidateVerdict:
     return sorted(e, key=lambda v: (-v.migration_confidence, v.hard_break_rate, _cpr_key(v), v.model))[0]
 
 
+def _quality_ties(elig: List[CandidateVerdict], leader: CandidateVerdict, s: Settings) -> set:
+    """Models statistically tied with the best-quality candidate (leader included).
+
+    Tied = the paired 95% bootstrap interval of (candidate - leader) contains 0, AND the
+    candidate is inside the quality-tolerance window -- the window stays a hard cap, so a tiny
+    run where every interval is wide can't make a far-behind model "equal" on quality.
+    Empty when ties are switched off or intervals weren't computed (older runs, 1 request)."""
+    if not s.statistical_ties or leader.confidence_ci_low is None:
+        return set()
+    floor = leader.migration_confidence - s.quality_tolerance - 1e-9
+    out = {leader.model}
+    for v in elig:
+        if v.model == leader.model or v.migration_confidence < floor:
+            continue
+        d = v.quality_diff_ci.get(leader.model)
+        if d and d[0] <= 0.0 <= d[1]:
+            out.add(v.model)
+    return out
+
+
+def _n_requests(v: CandidateVerdict) -> int:
+    return v.requests_scored or v.scored
+
+
 def _metric_desc(metric: str) -> str:
     return "median end-to-end latency" if metric == "p50" else "median ms per output token"
 
@@ -218,8 +242,16 @@ def build_recommendation(verdicts: List[CandidateVerdict],
     # ---- 2. axis scores ---- #
     q_best = max(v.migration_confidence for v in elig)
     tol_pts = s.quality_tolerance
+    # Statistical ties: candidates the paired bootstrap can't separate from the best-quality
+    # pick, inside the quality window, count as equal on quality (full quality score).
+    leader = _pick_best_quality(elig)
+    tied = _quality_ties(elig, leader, s)
+    rec.statistical_ties = bool(s.statistical_ties)
+    rec.quality_ties = sorted(tied, key=lambda m: (m != leader.model, m)) if len(tied) > 1 else []
 
-    def _quality_score(q: float) -> float:
+    def _quality_score(q: float, model: str = "") -> float:
+        if model in tied:
+            return 100.0
         if tol_pts <= 0:
             return 100.0 if q >= q_best else 0.0
         return round(min(100.0, max(0.0, 100.0 * (1.0 - (q_best - q) / tol_pts))), 2)
@@ -230,9 +262,12 @@ def build_recommendation(verdicts: List[CandidateVerdict],
     axes: Dict[str, CandidateAxes] = {}
     for v in elig:
         ax = CandidateAxes(model=v.model, quality=v.migration_confidence,
-                           quality_score=_quality_score(v.migration_confidence),
+                           quality_score=_quality_score(v.migration_confidence, v.model),
                            cost=cost_scores[v.model], latency=lat_scores[v.model],
-                           consistency=v.consistency)
+                           consistency=v.consistency,
+                           quality_ci=([v.confidence_ci_low, v.confidence_ci_high]
+                                       if v.confidence_ci_low is not None else None),
+                           quality_tied=v.model in tied and len(tied) > 1)
         ax.composite, ax.complete = _composite(ax, w)
         axes[v.model] = ax
         if ax.cost is None and w.cost > 0:
@@ -281,9 +316,14 @@ def build_recommendation(verdicts: List[CandidateVerdict],
 
     # ---- 5. Best quality ---- #
     bq = _pick_best_quality(elig)
+    others_tied = [m for m in rec.quality_ties if m != bq.model]
+    ci_txt = (f", 95% interval {bq.confidence_ci_low:.0f}–{bq.confidence_ci_high:.0f}"
+              if bq.confidence_ci_low is not None else "")
     profiles[ProfileKind.BEST_QUALITY] = Profile(
         kind=ProfileKind.BEST_QUALITY, model=bq.model,
-        reason=f"Highest Migration Confidence ({bq.migration_confidence:.1f}).")
+        reason=(f"Highest Migration Confidence ({bq.migration_confidence:.1f}{ci_txt})."
+                + (f" Statistically tied with {', '.join(others_tied)}: the difference is within "
+                   f"what {_n_requests(bq)} requests can resolve." if others_tied else "")))
 
     # ---- 6. Most economical / lowest latency within the quality tolerance ---- #
     floor = bq.migration_confidence - s.quality_tolerance
@@ -334,6 +374,10 @@ def build_recommendation(verdicts: List[CandidateVerdict],
 
     if len(elig) == 1:
         rec.notes.insert(0, "Only one candidate passed the quality gate.")
+    if rec.quality_ties:
+        rec.notes.insert(0, (f"Statistically tied on quality (95%): {', '.join(rec.quality_ties)}. "
+                             f"With {_n_requests(bq)} requests their confidence can't be separated, "
+                             "so cost and latency decide between them."))
     rec.profiles = [profiles[k] for k in _PROFILE_ORDER]
     _add_explanations(rec, verdicts, s)
     return rec
@@ -382,8 +426,27 @@ def refresh_verdicts(run, settings: Optional[Settings] = None) -> List[Candidate
     fresh = [aggregate(v.model, run.pair_scores, results, s.rubric, endpoint=v.endpoint,
                        samples=run.samples, settings=s, monthly_volume=volume)
              for v in run.verdicts]
+    _attach_intervals(fresh, run.pair_scores, s)
     run.verdicts = side_by_side(fresh)
     return run.verdicts
+
+
+def _attach_intervals(verdicts: List[CandidateVerdict], pair_scores, s: Settings) -> None:
+    """Bootstrap 95% intervals for each candidate's confidence and paired differences."""
+    from .stats import quality_stats
+    try:
+        st = quality_stats(pair_scores, [v.model for v in verdicts if v.scored], s.rubric)
+    except Exception:  # noqa: BLE001 -- intervals are additive; never break the results page
+        st = None
+    if st is None:
+        return
+    for v in verdicts:
+        ci = st.ci.get(v.model)
+        if ci is None:
+            continue
+        v.confidence_ci_low, v.confidence_ci_high = ci
+        v.quality_diff_ci = {o.model: list(d) for o in verdicts
+                             if o.model != v.model and (d := st.diff_ci(v.model, o.model)) is not None}
 
 
 def run_recommendation(run, settings: Optional[Settings] = None,

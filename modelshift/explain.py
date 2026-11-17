@@ -79,7 +79,14 @@ def explain(rec: Recommendation, verdicts: List[CandidateVerdict],
         first += f", {ax.composite - runner.composite:.1f} points ahead of {runner.model}"
     first += (", with " + _join(leads) if leads else "") + "."
     second = _answers(bo) + f", gate {max_hard_break_rate:.0%}."
-    if bo.consistency is not None and bo.replays > 1:
+    lead_q = (prof.get(ProfileKind.BEST_QUALITY) or object()).__dict__.get("model")
+    tied_q = bo.model in rec.quality_ties and lead_q and lead_q != bo.model
+    if tied_q:
+        lq = by.get(lead_q)
+        second += (f" Its quality is statistically tied with the best ({lead_q}, "
+                   f"{lq.migration_confidence:.1f}): {bo.migration_confidence - lq.migration_confidence:+.1f} "
+                   f"points is within what {_n_req(bo)} requests can resolve.")
+    elif bo.consistency is not None and bo.replays > 1:
         second += (f" Consistent across {bo.replays} replays (D7 {bo.consistency:.2f}, "
                    f"{bo.unstable_requests} of {bo.consistency_measured} requests unstable).")
     else:
@@ -94,14 +101,20 @@ def explain(rec: Recommendation, verdicts: List[CandidateVerdict],
     if q:
         rest = sorted((v for v in elig if v.model != q.model), key=lambda v: -v.migration_confidence)
         spread = q.migration_confidence - min(v.migration_confidence for v in elig)
-        if rest and q.migration_confidence - rest[0].migration_confidence < 0.05:
+        tied_with = [m for m in rec.quality_ties if m != q.model]
+        ci = (f" (95% interval {q.confidence_ci_low:.0f}–{q.confidence_ci_high:.0f})"
+              if q.confidence_ci_low is not None else "")
+        if tied_with:
+            l1 = (f"Confidence {q.migration_confidence:.1f}{ci}, statistically tied with "
+                  f"{_join(tied_with)}; the data can't separate them on quality.")
+        elif rest and q.migration_confidence - rest[0].migration_confidence < 0.05:
             o = rest[0]
             why = ("fewer hard breaks" if q.hard_break_rate < o.hard_break_rate
                    else "lower cost" if (q.cost_per_request or 9e9) < (o.cost_per_request or 9e9) else "")
             l1 = f"Confidence {q.migration_confidence:.1f}, tied with {o.model}" + (f"; wins on {why}." if why else ".")
         elif rest:
             gap = q.migration_confidence - rest[0].migration_confidence
-            l1 = (f"Confidence {q.migration_confidence:.1f}, {gap:.1f} "
+            l1 = (f"Confidence {q.migration_confidence:.1f}{ci}, {gap:.1f} "
                   f"points ahead of {rest[0].model}.")
         else:
             l1 = f"Confidence {q.migration_confidence:.1f}; the only candidate that passed the gate."
@@ -164,3 +177,7 @@ def explain(rec: Recommendation, verdicts: List[CandidateVerdict],
 
 def _join(items: List[str]) -> str:
     return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " and " + items[-1]
+
+
+def _n_req(v: CandidateVerdict) -> int:
+    return v.requests_scored or v.scored

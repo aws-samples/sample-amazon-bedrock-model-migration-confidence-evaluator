@@ -12,8 +12,10 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import time
 from typing import Any, Callable, Dict, Optional, Protocol
 
+from . import resilience as _resilience
 from .config import DEFAULT_RUBRIC, Rubric
 from .scoring import _cand_text, _golden_text, _label_from
 from .schemas import (
@@ -68,10 +70,11 @@ def _judge_cache_key(sample_id: str, model: str, output_text: str, steering: str
 
 class Judge:
     def __init__(self, transport: JudgeTransport, rubric: Rubric = DEFAULT_RUBRIC,
-                 steering: Optional[str] = None):
+                 steering: Optional[str] = None, sleep: Callable[[float], None] = time.sleep):
         self._transport = transport
         self._rubric = rubric
         self._steering = steering
+        self._sleep = sleep
         from .concurrency import SingleFlight
         # Thread-safe: concurrent workers judging the same answer make one judge call.
         self._flight: "SingleFlight[Dict[str, Any]]" = SingleFlight()
@@ -91,8 +94,20 @@ class Judge:
             return ps
 
         key = _judge_cache_key(sample.id, ps.model, _cand_text(output), self._steering or "")
-        verdict, _ = self._flight.get_or_compute(
-            key, lambda: self._transport(judge_prompt(sample, output, self._steering)))
+        try:
+            verdict, _ = self._flight.get_or_compute(
+                key, lambda: _resilience.call_with_retries(
+                    lambda: self._transport(judge_prompt(sample, output, self._steering)),
+                    max_retries=2, sleep=self._sleep))
+        except Exception as exc:  # noqa: BLE001 -- classified below
+            if _resilience.classify(exc) == _resilience.FATAL:
+                raise   # a configuration problem (permissions, bad model id): stop the run, say why
+            # Transient failure that survived the retries: keep this answer's deterministic score
+            # rather than throwing away a whole run for one judge call.
+            ps.judge_reason = None
+            ps.judge_rationale = (f"Judge unavailable after retries ({str(exc)[:120]}); "
+                                  "deterministic score kept.")
+            return ps
 
         sem = float(verdict.get("semantic", ps.d1_semantic.score))
         instr = float(verdict.get("instruction", 1.0))

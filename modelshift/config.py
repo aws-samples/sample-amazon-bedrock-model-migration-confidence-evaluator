@@ -124,9 +124,13 @@ class ModelCatalogEntry(BaseModel):
 
 
 def supported_efforts(model: Optional[str]) -> Optional[List[str]]:
-    """Efforts a catalog model accepts, or None for models not in the catalog (not validated)."""
+    """Efforts a model accepts: catalog list, probed list for a discovered model, or None
+    when unknown (not validated)."""
     entry = MODEL_CATALOG.get(base_model(model)) if model else None
-    return list(entry.reasoning_efforts) if entry else None
+    if entry:
+        return list(entry.reasoning_efforts)
+    from .discovery import supported_efforts as _discovered_efforts
+    return _discovered_efforts(model)
 
 
 MODEL_CATALOG: Dict[str, ModelCatalogEntry] = {
@@ -394,6 +398,10 @@ class Settings(BaseModel):
     min_latency_samples: int = 5
     latency_metric: str = "per_token"   # "per_token" (median ms / output token) | "p50"
     missing_axis_margin: float = 5.0
+    # Statistical ties: candidates whose Migration Confidence can't be separated from the
+    # best-quality pick (paired 95% bootstrap interval of the difference contains 0) get the
+    # full quality score, so the pick between them rests on cost and latency.
+    statistical_ties: bool = True
     # Weight presets as data (quality, cost, latency). Normalised to sum to 1 when used.
     weight_presets: Dict[str, Dict[str, float]] = Field(default_factory=lambda: {
         k: dict(v) for k, v in WEIGHT_PRESETS.items()})
@@ -522,8 +530,7 @@ def load_settings(into: Settings = DEFAULT_SETTINGS) -> Settings:
 RECOMMENDATION_SETTING_KEYS = (
     "min_confidence", "max_hard_break_rate", "max_error_rate", "min_scored",
     "quality_tolerance", "min_latency_samples", "latency_metric", "missing_axis_margin",
-    "weight_presets",
-    "default_replays", "replay_call_ceiling", "instability_threshold",
+    "weight_presets", "statistical_ties", "replay_call_ceiling", "instability_threshold",
     "max_flip_rate", "min_consistency",
 )
 
@@ -568,6 +575,8 @@ def _apply_recommendation_settings(into: Settings, data: Dict) -> None:
             setattr(into, k, max(0, data[k]))
     if data.get("latency_metric") in ("per_token", "p50"):
         into.latency_metric = data["latency_metric"]
+    if isinstance(data.get("statistical_ties"), bool):
+        into.statistical_ties = data["statistical_ties"]
     presets = data.get("weight_presets")
     if isinstance(presets, dict):
         for name, w in presets.items():

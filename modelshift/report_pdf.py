@@ -133,6 +133,17 @@ def hexs(c: Color) -> str:
     return "#%02x%02x%02x" % (round(c.red * 255), round(c.green * 255), round(c.blue * 255))
 
 
+def ci_range(c) -> str:
+    """"79–97" from a candidate's 95% bootstrap interval, or "" when not computed."""
+    lo, hi = (c or {}).get("confidence_ci_low"), (c or {}).get("confidence_ci_high")
+    return f"{lo:.0f}–{hi:.0f}" if lo is not None and hi is not None else ""
+
+
+def ci_suffix(c) -> str:
+    r = ci_range(c)
+    return f" · 95% CI {r}" if r else ""
+
+
 def pct(n) -> str:
     return "—" if n is None else f"{round(n)}%"
 
@@ -648,7 +659,7 @@ def _hero(ctx: Ctx, report: Dict[str, Any]) -> Optional[Box]:
             ctx.P(summary, "dim")]
     conf = best.get("migration_confidence") or 0
     right = [ctx.P(f'<font color="{hexs(bc)}">{pct(conf)}</font>', "big_r"),
-             ctx.P("Migration Confidence", "muted_r"), Spacer(1, 6),
+             ctx.P("Migration Confidence" + ci_suffix(best), "muted_r"), Spacer(1, 6),
              Bar(conf / 100.0, bc, t["surface2"], height=6)]
     body = hrow([left, "", right], [iw * 0.64, iw * 0.06, iw * 0.30], valign="MIDDLE")
     return card(ctx, [body], accent_left=bc, pad=(14, 14, 14, 17))
@@ -907,7 +918,7 @@ def _cand_card(ctx: Ctx, c: Dict[str, Any], width: float) -> Box:
         ctx.P("via " + esc(ENDPOINT_TEXT.get(ep, ep)), "monosm") if ep else None,
         Spacer(1, 8),
         ctx.P(pct(c.get("migration_confidence")), "big"),
-        ctx.P("Migration Confidence", "muted"),
+        ctx.P("Migration Confidence" + ci_suffix(c), "muted"),
         Spacer(1, 7),
         DistBar(ctx, dist, height=8),
         Spacer(1, 4),
@@ -936,7 +947,8 @@ def _side_by_side(ctx: Ctx, cands: List[Dict[str, Any]],
         rows.append([
             ctx.P(esc(c["model"]), "tdm"),
             ctx.P(f'<font color="{hexs(ctx.score_color((c.get("migration_confidence") or 0) / 100))}"><b>'
-                  f'{pct(c.get("migration_confidence"))}</b></font>', "td"),
+                  f'{pct(c.get("migration_confidence"))}</b></font>'
+                  + (f'<br/><font size="6.5">{ci_range(c)}</font>' if ci_range(c) else ""), "td"),
             ctx.P(pct((c.get("hard_break_rate") or 0) * 100), "td"),
             ctx.P(esc(cost1k(c)), "td"),
             ctx.P(signed_pct(c.get("cost_vs_current_pct")), "td"),

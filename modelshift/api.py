@@ -208,6 +208,44 @@ def list_models():
     }
 
 
+def _region() -> str:
+    return os.environ.get("MODELSHIFT_REGION") or os.environ.get("AWS_REGION") or "us-east-1"
+
+
+@app.get("/api/v1/models/available")
+def available_models(endpoint: str = "bedrock_runtime", legacy: Optional[str] = None, refresh: bool = False):
+    """Models the selected endpoint offers right now (live list; catalog models matched first).
+    Never 500s on an unreachable endpoint: returns the catalog plus a `reason`."""
+    from .discovery import available
+    try:
+        return available(endpoint, _region(), legacy_model=legacy, refresh=refresh)
+    except ValueError as e:
+        raise HTTPException(400, detail={"error": {"code": "invalid_endpoint", "message": str(e)}})
+
+
+class ProbeBody(BaseModel):
+    name: str
+
+
+@app.post("/api/v1/models/probe-efforts")
+def probe_model_efforts(body: ProbeBody):
+    """Check which reasoning efforts a listed (non-catalog) model accepts: one tiny call per
+    effort. Results are saved, so each model is checked once."""
+    from .discovery import get, probe_efforts
+    dm = get(body.name)
+    if dm is None:
+        raise HTTPException(404, detail={"error": {"code": "not_found",
+                                                   "message": f"{body.name} is not a listed model"}})
+    if _ORCH is None:
+        raise HTTPException(409, detail={"error": {"code": "conflict", "message": "server has no transports"}})
+    transport = {"litellm": _ORCH._litellm_transport, "mantle": _ORCH._mantle_transport}.get(
+        dm.endpoint, _ORCH._candidate_transport)
+    if transport is None:
+        raise HTTPException(409, detail={"error": {"code": "conflict",
+                                                   "message": f"no transport for the {dm.endpoint} endpoint"}})
+    return probe_efforts(body.name, transport)
+
+
 @app.post("/api/v1/uploads", status_code=201)
 async def upload_file(file: UploadFile):
     # Read in chunks and enforce a hard size cap (DoS guard) instead of an

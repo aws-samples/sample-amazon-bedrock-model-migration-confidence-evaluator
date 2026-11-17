@@ -10,6 +10,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 
 import uvicorn
 
@@ -93,6 +94,7 @@ def main():
     ap.add_argument("--host", default=_env("MODELSHIFT_HOST", "127.0.0.1"))
     ap.add_argument("--port", type=int, default=int(_env("MODELSHIFT_PORT", "8971")))
     args = ap.parse_args()
+    os.environ.setdefault("MODELSHIFT_REGION", args.region)  # model discovery lists this region
 
     # Mode: explicit --demo/--live flag wins; else MODELSHIFT_MODE=demo|live; else live.
     mode = "demo" if args.demo else ("live" if args.live else _env("MODELSHIFT_MODE", "live").lower())
