@@ -10,13 +10,23 @@ ModelShift takes a customer's existing **LiteLLM logs**, **replays each captured
 
 ![ModelShift overall flow](assets/overall-flow.png)
 
-**Start a run** — upload or point at logs, narrow the slice, and choose candidate models:
+**1. Start a run** — load a LiteLLM log (or a zip, an S3 prefix, or hand-typed prompts), choose how models are called (Bedrock Runtime, Bedrock Mantle or a LiteLLM proxy), and pick candidates from the live model list, each with its own reasoning efforts. Optionally replay every request for a consistency score. The estimate shows calls, cost and time before you launch:
 
-![New run page](assets/new-run-page.png)
+![New run: source, live model picker with per-model reasoning efforts, replays and estimate](assets/screenshot-new-run.png)
 
-**Read the results** — side-by-side candidate cards, per-dimension scores, and the migration-confidence verdict:
+**2. Watch it run** — every call is visible: calls in flight, throttles, retries, spend so far and a per-candidate grid you can click into. A slow or retrying call holds only its own slot:
 
-![Results page](assets/results-page.png)
+![Running view: progress, parallel calls, per-candidate call grid and in-flight calls](assets/screenshot-running.png)
+
+**3. Get a recommendation** — the best overall model by quality, cost and latency, with its 95% confidence interval, hard breaks, consistency and a short "why this pick". Models whose quality can't be told apart are marked as statistically tied, so cost and latency decide between them:
+
+![Recommendation: best overall, best quality and why this pick](assets/screenshot-recommendation.png)
+
+**4. Read the results** — a card per candidate, a side-by-side table, a per-dimension breakdown with the recommended models' columns marked, and the least consistent requests:
+
+![Results page: candidate cards, side-by-side table, dimension breakdown and least consistent requests](assets/screenshot-results.png)
+
+Parts of these screenshots are blurred or blacked out to hide customer data.
 
 ---
 
@@ -28,8 +38,8 @@ A newer model that is *more accurate* but changes the output format, drops a fac
 
 1. **Load logs — or enter prompts** — upload a LiteLLM log file (or a **.zip** of them, nested folders included), point at an `s3://bucket/prefix`, **or type one or more prompt / golden-response pairs directly in the UI** when you don't have a log export. App-side prompt captures and saved chat conversations are recognized too. Hand-entered pairs become the dataset and flow through the exact same pipeline as logged requests.
 2. **Auto-detect & normalize** — parses SpendLogs (`proxy_server_request`), wrapped-SDK, Chat Completions, and Responses shapes; converts legacy Chat Completions to the Responses API shape; drops non-evaluable rows with full accounting.
-3. **Pick candidates** — pre-filled from the migration matrix (GPT-4.1 → Luna/Terra/Sol, etc.), evaluated **side-by-side**. Pick one or more **reasoning efforts**; each `model@effort` runs as its own candidate, and only the efforts each model accepts on Bedrock are offered.
-4. **Choose call path** — **Bedrock (direct)** or **LiteLLM proxy**.
+3. **Pick candidates** — the available models are **listed live** from the endpoint you choose, with search and provider filters. Models suggested for the legacy model in the migration matrix (GPT-4.1 → Luna/Terra/Sol, etc.) are pre-selected, and everything is evaluated **side-by-side**. Set **reasoning efforts per model**: each `model@effort` runs as its own candidate, and only the efforts a model accepts are offered (for a model ModelShift doesn't know yet, it checks with one tiny call per effort). A model without a configured price still runs; its cost is left out of the ranking.
+4. **Choose call path** — **Bedrock Runtime**, **Bedrock Mantle** (both signed with your AWS credentials) or a **LiteLLM proxy**.
 5. **Replay & score** — six dimensions (semantic, format/schema, factual, verbosity, instruction-following, tool-call) → four labels → **Migration Confidence 0–100** and a verdict band. Optionally **replay each request 2–5 times** to measure consistency (D7). Calls are sent **several at a time**, slowing down automatically if Bedrock throttles.
 6. **Recommend** — name the best model **all things considered** (quality, cost, latency), plus Best quality, Most economical and Lowest latency, each with a short data-driven explanation.
 7. **Remediate** — cluster failures by reason, suggest changes, re-test a subset, see a before/after delta.
@@ -53,13 +63,14 @@ Notes:
 
 - **Quality gate first.** Only candidates with enough confidence (default ≥ 65), few hard breaks (≤ 5%) and few errors can be recommended. If none pass, the page says so and names the closest by fit instead of forcing a pick.
 - **Best overall** is the highest weighted score of quality, cost and latency (*Balanced* = 50 / 30 / 20; also *Quality*, *Cost*, *Latency* or custom weights, changeable after the run without re-running anything). Quality is always pure Migration Confidence; nothing else is blended into it.
+- **Confidence and ties.** Each candidate's Migration Confidence is shown with a 95% interval (a bootstrap over your requests, so it widens when you run fewer). When a candidate can't be separated from the best on quality (the interval of the difference includes zero, and it is inside the 10-point window), it counts as equal on quality, so cost and latency decide between them. The page lists these as *statistically tied*. This can be switched off in Settings.
 - **Best quality, Most economical, Lowest latency** are named alongside, each with a plain trade-off against Best overall. Cheaper and faster picks must stay within 10 confidence points of the best quality.
 - **Why this pick** gives two short lines per pick, built from the run's own numbers, e.g. *"Top weighted score (97.7), 14.6 points ahead of gpt-5.6-luna@high, with the highest confidence (94.5) and the lowest cost ($0.73 per 1K requests)"*. A caveat only appears when it's true, such as a model that's fastest per output token but slower per request because its answers are longer.
 - **Cost** uses public Amazon Bedrock list prices and assumes no prompt caching. **Latency** is measured from the machine running the evaluation, so it's indicative, not a production benchmark.
 
 **Request replays and consistency (D7).** Turn on *Replay requests* on the Configuration step to send each request 2–5 times (multiplying calls and cost). Every replayed answer is scored like a normal call. A separate **D7 Consistency** score (0–1) measures how alike the answers to the same request are and how often they got the same label; it never changes a label or Migration Confidence. Models with unstable answers get an **Unstable** badge, the results list the least consistent requests, and optional gates in Settings can require a minimum consistency or a maximum *flip rate* (requests where some answers hard-break and others don't).
 
-**Parallel calls.** Calls are sent several at a time (**Settings → Parallel calls**, default 4, max 16, with a server-wide cap across runs). If Bedrock throttles, ModelShift halves that endpoint's parallel calls and speeds back up after clean calls; throttled calls are retried, so no answers are lost. The Running view shows every call in flight, throttles and any slow-down, and the results record an execution summary such as *"Sent 4 at a time · 3 throttles · slowed to 2 for 1m 35s"*. Results are stored in the same order as a one-at-a-time run, so verdicts don't depend on concurrency.
+**Parallel calls.** Calls are sent several at a time (**Settings → Parallel calls**, default 4, max 16, with a server-wide cap across runs). If Bedrock throttles, ModelShift halves that endpoint's parallel calls and speeds back up after clean calls; throttled calls are retried, so no answers are lost. Every call has a hard time limit (120 seconds by default) and only transient failures are retried, with capped, jittered exponential back-off: a timeout is retried once, and validation or permission errors are not retried at all. A later replay pass starts as soon as a slot is free, so one slow call never holds up the run. The Running view shows every call in flight, throttles and any slow-down, and the results record an execution summary such as *"Sent 4 at a time · 3 throttles · slowed to 2 for 1m 35s"*. Results are stored in the same order as a one-at-a-time run, so verdicts don't depend on concurrency.
 
 The same recommendation, explanations, consistency and execution summary appear in the **PDF report** and the **JSON report**.
 
