@@ -26,7 +26,6 @@ ModelShift takes a customer's existing **LiteLLM logs**, **replays each captured
 
 ![Results page: candidate cards, side-by-side table, dimension breakdown and least consistent requests](assets/screenshot-results.png)
 
-Parts of these screenshots are blurred or blacked out to hide customer data.
 
 ---
 
